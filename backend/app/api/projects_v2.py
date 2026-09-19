@@ -325,6 +325,88 @@ async def export_project_v2(project_id: str):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+# ---------------- 流水线 ----------------
+
+
+class PipelineStartRequest(BaseModel):
+    script_text: str | None = None
+    materials: list[dict] | None = None  # [{url, kind?, filename?, text?}]
+    settings: dict | None = None  # 顺带更新 video_model/voice_model 等
+
+
+class PipelineAdvanceRequest(BaseModel):
+    confirmed: bool = False  # review/bindings 门禁确认
+
+
+@router.post("/{project_id}/pipeline/start")
+async def pipeline_start(project_id: str, req: PipelineStartRequest):
+    from ..harness.errors import ProjectNotFoundError, RunBusyError
+    from ..services import pipeline as pipeline_svc
+
+    try:
+        if req.settings:
+            def fn(p) -> None:
+                merged = p.settings.model_dump()
+                merged.update(req.settings or {})
+                p.settings = type(p.settings).model_validate(merged)
+            project_store.mutate(project_id, fn)
+        return pipeline_svc.start_pipeline(
+            project_id,
+            payload={"script_text": req.script_text, "materials": req.materials or []},
+        )
+    except ProjectNotFoundError as exc:
+        raise _http(exc) from exc
+    except RunBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except InvariantViolation as exc:
+        raise _http(exc) from exc
+
+
+@router.post("/{project_id}/pipeline/advance")
+async def pipeline_advance(project_id: str, req: PipelineAdvanceRequest):
+    from ..harness.errors import ProjectNotFoundError, RunBusyError
+    from ..services import pipeline as pipeline_svc
+
+    try:
+        return pipeline_svc.advance_pipeline(project_id, confirmed=req.confirmed)
+    except ProjectNotFoundError as exc:
+        raise _http(exc) from exc
+    except RunBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.post("/{project_id}/bindings/confirm")
+async def bindings_confirm(project_id: str, req: PipelineAdvanceRequest):
+    """确认全部待定素材绑定（保留现状），随后自动续跑流水线。"""
+    from ..harness.errors import ProjectNotFoundError, RunBusyError
+    from ..services import pipeline as pipeline_svc
+
+    try:
+        project_store.mutate(project_id, lambda p: setattr(p, "pending_bindings", []))
+        return pipeline_svc.advance_pipeline(project_id, confirmed=req.confirmed)
+    except ProjectNotFoundError as exc:
+        raise _http(exc) from exc
+    except RunBusyError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@router.get("/{project_id}/runs")
+async def list_project_runs(project_id: str):
+    from ..harness import trace as trace_mod
+
+    return {"runs": trace_mod.list_runs(project_id=project_id, limit=10)}
+
+
+@router.get("/{project_id}/runs/{run_id}/trace")
+async def get_run_trace(project_id: str, run_id: str):
+    from ..harness import trace as trace_mod
+
+    events = trace_mod.read_trace(run_id, limit=300)
+    if not events or events[0].get("project_id") != project_id:
+        raise HTTPException(status_code=404, detail="运行记录不存在")
+    return {"run_id": run_id, "events": events}
+
+
 # ---------------- SSE 事件流 ----------------
 
 
