@@ -256,6 +256,75 @@ async def unbind_material(project_id: str, req: BindRequest):
         raise _http(exc) from exc
 
 
+# ---------------- 手动生成（与 agent/pipeline 共用 generation_service） ----------------
+
+
+class GenerateRequest(BaseModel):
+    kind: Literal["keyframe", "voice", "video"]
+    prompt: str | None = None  # keyframe 描述覆盖
+    text: str | None = None    # voice 文本覆盖
+    force: bool = False
+    use_uploaded: bool = False
+    reference_scene_id: str | None = None
+
+
+@router.post("/{project_id}/scenes/{scene_id}/generate")
+async def generate_for_scene(project_id: str, scene_id: str, req: GenerateRequest):
+    """单镜手动生成：关键帧/配音后台执行（经 SSE 推送状态），视频提交即返回。"""
+    import asyncio
+
+    from ..services import generation_service
+
+    project = project_store.get(project_id)
+    if project is None:
+        raise HTTPException(status_code=404, detail="项目不存在")
+    scene = next((s for s in project["scenes"] if s["id"] == scene_id), None)
+    if scene is None:
+        raise HTTPException(status_code=404, detail=f"分镜不存在：{scene_id}")
+
+    if req.kind == "video":
+        result = generation_service.submit_scene_video(project_id, scene_id)
+        if not result.get("ok"):
+            raise HTTPException(status_code=400, detail=result.get("error", "提交失败"))
+        return result
+
+    async def _run() -> None:
+        try:
+            if req.kind == "keyframe":
+                await generation_service.generate_keyframe(
+                    project_id, scene_id,
+                    prompt_override=req.prompt, reference_scene_id=req.reference_scene_id,
+                )
+            else:
+                await generation_service.generate_voice(
+                    project_id, scene_id,
+                    text_override=req.text, force=req.force, use_uploaded=req.use_uploaded,
+                )
+        except Exception as exc:  # noqa: BLE001 - 后台失败写进分镜状态，由 SSE 推给前端
+            def _fail(p) -> None:
+                s = next((x for x in p.scenes if x.id == scene_id), None)
+                if s:
+                    s.status = "failed"
+                    s.error = f"{req.kind} 生成异常：{str(exc)[:200]}"
+            try:
+                project_store.mutate(project_id, _fail)
+            except Exception:  # noqa: BLE001
+                pass
+
+    asyncio.create_task(_run())
+    return {"ok": True, "queued": req.kind, "scene_id": scene_id}
+
+
+@router.post("/{project_id}/export")
+async def export_project_v2(project_id: str):
+    from ..services import export_service
+
+    try:
+        return await export_service.export_project_v2(project_id)
+    except RuntimeError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 # ---------------- SSE 事件流 ----------------
 
 

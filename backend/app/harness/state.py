@@ -111,6 +111,8 @@ class Scene(BaseModel):
     status: SceneStatus = "planned"
     error: str | None = None
     revision: int = 0
+    # 调谐器自动重试计数（kind → 次数）：keyframe/voice/video
+    attempts: dict[str, int] = Field(default_factory=dict)
 
 
 class PendingBinding(BaseModel):
