@@ -16,6 +16,9 @@ def list_projects() -> list[dict]:
     for f in settings.PROJECTS_DIR.glob("project_*.json"):
         try:
             data = json.loads(f.read_text(encoding="utf-8"))
+            # v2 项目由 project_store 管理，旧服务不可见（桥接期隔离）
+            if data.get("schema_version") == 2:
+                continue
             items.append(
                 {
                     "id": data["id"],
@@ -38,9 +41,12 @@ def get_project(project_id: str) -> dict | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+    if data.get("schema_version") == 2:
+        return None
+    return data
 
 
 def create_project(name: str, aspect_ratio: str = "16:9") -> dict:
@@ -57,6 +63,14 @@ def create_project(name: str, aspect_ratio: str = "16:9") -> dict:
 
 
 def save_project(project_id: str, data: dict) -> dict | None:
+    path = settings.PROJECTS_DIR / f"{project_id}.json"
+    # v2 项目严禁被旧接口整包覆盖（upsert 会把 v2 文件改写成 v1 形状）
+    if path.exists():
+        try:
+            if json.loads(path.read_text(encoding="utf-8")).get("schema_version") == 2:
+                return None
+        except Exception:
+            pass
     existing = get_project(project_id)
     data["id"] = project_id
     data["updated_at"] = _now()

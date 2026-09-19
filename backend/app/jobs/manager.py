@@ -1,6 +1,7 @@
 """JobManager：进程内异步任务 + data/jobs/{job_id}.json 状态持久化。不引入 Celery/Redis。"""
 import asyncio
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 
@@ -24,9 +25,11 @@ class JobManager:
         return settings.JOBS_DIR / f"{job_id}.json"
 
     def _persist(self, job: dict) -> None:
-        self._path(job["id"]).write_text(
-            json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
+        # 原子替换：崩溃不留半截 JSON（旧行为直接 write_text，断电即损坏且被 _load_existing 静默丢弃）
+        path = self._path(job["id"])
+        tmp = path.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(job, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(tmp, path)
 
     def _load_existing(self) -> None:
         for f in settings.JOBS_DIR.glob("*.json"):
