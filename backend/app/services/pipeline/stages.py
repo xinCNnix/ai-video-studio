@@ -439,8 +439,10 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
     decisions: list[tuple[str, str, str, str]] = []  # (scene_id, kind, material_id, role)
     pending: list[dict] = []
     claimed: set[str] = set()
+    dropped_wants: list[dict] = []  # plan 引用了不存在/类型不符的素材：留痕供排查
 
-    # 1) wants 里的 material_id 精确引用
+    # 1) wants 里的 material_id 精确引用；幻觉 id 不生效（素材保持未认领，交给兜底），
+    #    但绝不静默——记入 dropped_wants，方便排查"模型以为引用了实际没挂上"
     for scene in project.scenes:
         w = wants_map.get(scene.id) or {}
         for want in w.get("wants_images") or []:
@@ -448,16 +450,28 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
             if mid and mid in materials:
                 decisions.append((scene.id, "image", mid, want.get("role") or "reference"))
                 claimed.add(mid)
+            elif mid:
+                dropped_wants.append({"scene": scene.title, "kind": "image", "material_id": mid})
         for want in w.get("wants_audios") or []:
             mid = want.get("material_id")
             if mid and mid in materials and materials[mid].kind == "audio":
                 decisions.append((scene.id, "audio", mid, "reference"))
                 claimed.add(mid)
+            elif mid:
+                dropped_wants.append({
+                    "scene": scene.title, "kind": "audio", "material_id": mid,
+                    "note": "素材不存在" if mid not in materials else "素材类型不是音频",
+                })
         for want in w.get("wants_videos") or []:
             mid = want.get("material_id")
             if mid and mid in materials:
                 decisions.append((scene.id, "video", mid, "reference"))
                 claimed.add(mid)
+            elif mid:
+                dropped_wants.append({"scene": scene.title, "kind": "video", "material_id": mid})
+    if dropped_wants and trace:
+        trace.log("bind_want_dropped", count=len(dropped_wants),
+                  detail=[d["material_id"] for d in dropped_wants][:10])
 
     # 2) 未被引用的上传音频：确定性台词对号分发
     free_audios = [m.url for m in project.materials if m.kind == "audio" and m.url and m.id not in claimed]
@@ -545,4 +559,6 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
     result = {"ok": True, "bound": len(decisions), "pending": len(pending)}
     if pending:
         result["pending_bindings"] = pending
+    if dropped_wants:
+        result["dropped_wants"] = dropped_wants[:20]
     return result

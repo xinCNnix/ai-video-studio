@@ -4,7 +4,6 @@
 Project 模型与 check_invariants——素材引用不存在、超契约数量、时长越界等
 非法状态在落盘前被拒绝，而不是等到提交视频 API 时才炸。
 """
-import re
 import uuid
 from typing import Literal
 
@@ -197,31 +196,10 @@ def check_invariants(p: Project) -> list[str]:
     return violations
 
 
-# ---------------- 提交级校验（generation_service 调用，单一事实来源） ----------------
-
-_REF_TAG_RE = re.compile(r"<\s*(Picture|Video|Audio)\s+(\d+)\s*/?\s*>", re.IGNORECASE)
-
-
-def prompt_tag_errors(scene: Scene, *, keyframe_counts_as_image: bool = False) -> list[str]:
-    """Prompt 内 <Picture/Video/Audio N> 编号不得悬空：N 必须 ≤ 实际传入数量。
-
-    keyframe_counts_as_image：i2v+参考混传模式下关键帧会并入参考图序列（H3 V2
-    官方路径），此时 <Picture 1> 指向关键帧，可用编号上界 +1。
-    """
-    n_images = len(scene.binding.images) + (1 if keyframe_counts_as_image else 0)
-    n_videos = len(scene.binding.videos)
-    n_audios = len(scene.binding.audios)
-    limits = {"picture": n_images, "video": n_videos, "audio": n_audios}
-    errors: list[str] = []
-    for m in _REF_TAG_RE.finditer(scene.prompt):
-        kind = m.group(1).lower()
-        n = int(m.group(2))
-        limit = limits.get(kind, 0)
-        if limit == 0 or n < 1 or n > limit:
-            errors.append(
-                f"Prompt 引用 <{m.group(1)} {n}> 悬空：该镜实际传入图 {n_images}/视频 {n_videos}/音频 {n_audios}"
-            )
-    return errors
+# ---------------- 模型目录与时长钳制 ----------------
+# 注：Prompt 内 <Picture/Video/Audio N> 悬空标签的提交级校验唯一实现位于
+# generation_service.assemble_video_request（对着组装后实际传入的素材列表检查），
+# 不要在此再复制一份。
 
 
 def find_video_model(model_id: str | None) -> dict | None:

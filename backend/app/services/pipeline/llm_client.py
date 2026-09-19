@@ -44,6 +44,66 @@ def repair_json_literals(text: str) -> str:
     return "".join(out)
 
 
+def repair_unescaped_quotes(text: str) -> str:
+    """把字符串值里未转义的英文双引号补成 \\"——模型常在中文句子里夹 ASCII 引号
+    （复现事故：logline 写"围绕\\"白斑变清楚\\"这一"，json.loads 把内容引号当字符串
+    终结符，连续 3 轮修复全失败导致 normalize 中止）。
+
+    判定：字符串内部的 "，其后第一个非空白字符是 JSON 结构符（, : } ]）或已到
+    末尾 → 视为真正的终结符；否则视为内容引号，转义保留。中文行文里内容引号后面
+    跟的全角标点不会误判；ASCII 逗号紧跟内容引号的极端歧义不覆盖，由候选兜底。
+    """
+    out: list[str] = []
+    i = 0
+    n = len(text)
+    in_str = False
+    esc = False
+    while i < n:
+        ch = text[i]
+        if esc:
+            out.append(ch)
+            esc = False
+            i += 1
+            continue
+        if ch == "\\" and in_str:
+            out.append(ch)
+            esc = True
+            i += 1
+            continue
+        if ch == '"':
+            if not in_str:
+                in_str = True
+                out.append(ch)
+                i += 1
+                continue
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j >= n or text[j] in ",:}]":
+                in_str = False
+                out.append(ch)
+            else:
+                out.append('\\"')
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_variants(text: str) -> list[str]:
+    """按"原样 → 字面量修复 → 引号修复 → 叠加"给出候选（去重保序）。"""
+    variants = [text]
+    for v in (
+        repair_json_literals(text),
+        repair_unescaped_quotes(text),
+        repair_json_literals(repair_unescaped_quotes(text)),
+    ):
+        if v not in variants:
+            variants.append(v)
+    return variants
+
+
 def scan_json_objects(text: str) -> list[str]:
     """按括号配平扫描文本里所有 {...} 片段（字符串/转义感知，容忍前后夹杂说明文字）。"""
     fragments: list[str] = []
@@ -76,18 +136,27 @@ def scan_json_objects(text: str) -> list[str]:
 
 
 def parse_json_candidates(text: str) -> list[dict]:
-    """提取文本中所有能解析成 dict 的 {...}（容忍字符串值里的真实换行）。"""
+    """提取文本中所有能解析成 dict 的 {...}（容忍字符串值里的真实换行与未转义引号）。
+
+    引号修复版也要参与括号扫描：内容引号会把扫描器的字符串状态打翻，先修复
+    才能扫出正确的对象边界。
+    """
     out: list[dict] = []
-    for frag in scan_json_objects(text):
-        parsed = None
-        for cand in (frag, repair_json_literals(frag)):
-            try:
-                parsed = json.loads(cand)
-            except json.JSONDecodeError:
+    seen_frags: set[str] = set()
+    for base in _repair_variants(text):
+        for frag in scan_json_objects(base):
+            if frag in seen_frags:
                 continue
-            break
-        if isinstance(parsed, dict):
-            out.append(parsed)
+            seen_frags.add(frag)
+            parsed = None
+            for cand in _repair_variants(frag):
+                try:
+                    parsed = json.loads(cand)
+                except json.JSONDecodeError:
+                    continue
+                break
+            if isinstance(parsed, dict):
+                out.append(parsed)
     return out
 
 
@@ -143,8 +212,9 @@ class LLMEnvelope:
                     self.trace.count("validation_errors")
                 feedback = (
                     "上一轮输出无法解析为 JSON 对象。可能原因：输出被 max_tokens 截断、夹杂多余说明文字、"
-                    "或字符串值里包含未转义的换行。请重新输出【一个完整合法的 JSON 对象】（不要代码块围栏、"
-                    "不要任何 JSON 以外的文字、字符串值用 \\n 转义换行）。"
+                    "字符串值里包含未转义的换行或英文双引号。请重新输出【一个完整合法的 JSON 对象】"
+                    "（不要代码块围栏、不要任何 JSON 以外的文字；字符串值用 \\n 转义换行，"
+                    "值内的英文双引号写成 \\\" 或改用中文引号「」）。"
                 )
                 messages.append({"role": "assistant", "content": raw[:4000]})
                 messages.append({"role": "user", "content": feedback})
@@ -174,7 +244,7 @@ class LLMEnvelope:
             return None
         fenced = re.sub(r"^```(?:json)?\s*", "", text)
         fenced = re.sub(r"\s*```$", "", fenced)
-        for cand in (fenced, repair_json_literals(fenced)):
+        for cand in _repair_variants(fenced):
             try:
                 data = json.loads(cand)
             except json.JSONDecodeError:
