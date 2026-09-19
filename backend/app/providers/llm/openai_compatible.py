@@ -52,7 +52,15 @@ class OpenAICompatibleLLM(LLMProvider):
             raise ProviderError(f"LLM 返回 {resp.status_code}：{text}")
         data = resp.json()
         try:
-            content = data["choices"][0]["message"]["content"]
+            choice = data["choices"][0]
+            content = choice["message"]["content"]
         except (KeyError, IndexError, TypeError) as exc:
             raise ProviderError(f"LLM 响应格式异常：{str(data)[:300]}") from exc
+        if not (content or "").strip():
+            # 推理模型（如 MiniMax-M3）max_tokens 不够覆盖思考过程时会返回空正文；
+            # 显式报错走重试，避免空字符串静默流向结构化校验
+            raise ProviderError(
+                f"模型返回空内容（finish_reason={choice.get('finish_reason')}），"
+                "可能 max_tokens 不足以覆盖推理过程，请调大后重试。"
+            )
         return _strip_think(content or "")

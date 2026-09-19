@@ -146,6 +146,8 @@ async def run_stream(req: AgentRunRequest):
             if event.get("tool"):
                 step["type"] = "tool"
                 step["tool"] = event["tool"]
+                if event.get("ok") is not None:
+                    step["ok"] = bool(event["ok"])
                 step["text"] = f"{event['tool']} {'✓' if event.get('ok', True) else '✕'}"
             elif event.get("mode"):
                 step["text"] = f"路由：{event['mode']}"

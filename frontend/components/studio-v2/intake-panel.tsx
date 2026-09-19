@@ -61,7 +61,7 @@ export function IntakePanel() {
 
   return (
     <div
-      className="rounded-2xl border border-dashed border-border bg-card/40 p-5"
+      className="shrink-0 rounded-2xl border border-dashed border-border bg-card/40 p-5"
       onDragOver={(e) => e.preventDefault()}
       onDrop={(e) => {
         e.preventDefault();
@@ -82,19 +82,22 @@ export function IntakePanel() {
         className="mt-3 h-32 w-full resize-none rounded-xl border border-border bg-background/60 p-3 text-sm leading-relaxed outline-none focus:border-primary/60"
       />
       {materials.length > 0 && (
-        <div className="mt-2 flex flex-wrap gap-2">
-          {materials.map((m) => (
-            <span
-              key={m.url}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/50 px-2 py-1 text-[11px]"
-            >
-              {m.kind === "image" ? <ImageIcon className="size-3" /> : m.kind === "audio" ? <Mic className="size-3" /> : <FileText className="size-3" />}
-              {m.filename}
-              <button type="button" className="cursor-pointer text-muted-foreground hover:text-foreground" onClick={() => setMaterials((ms) => ms.filter((x) => x.url !== m.url))}>
-                <X className="size-3" />
-              </button>
-            </span>
-          ))}
+        <div className="mt-2">
+          <div className="mb-1 text-[10px] text-muted-foreground">已选素材 {materials.length} 项（区域可滚动）</div>
+          <div className="flex max-h-36 flex-wrap gap-2 overflow-y-auto pr-1">
+            {materials.map((m) => (
+              <span
+                key={m.url}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/50 px-2 py-1 text-[11px]"
+              >
+                {m.kind === "image" ? <ImageIcon className="size-3" /> : m.kind === "audio" ? <Mic className="size-3" /> : <FileText className="size-3" />}
+                {m.filename}
+                <button type="button" className="cursor-pointer text-muted-foreground hover:text-foreground" onClick={() => setMaterials((ms) => ms.filter((x) => x.url !== m.url))}>
+                  <X className="size-3" />
+                </button>
+              </span>
+            ))}
+          </div>
         </div>
       )}
       <div className="mt-3 flex items-center gap-2">

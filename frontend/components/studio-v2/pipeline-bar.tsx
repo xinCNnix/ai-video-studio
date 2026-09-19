@@ -19,7 +19,7 @@ export function PipelineBar() {
   const currentIndex = STAGES.indexOf(pipeline.stage as (typeof STAGES)[number]);
 
   return (
-    <div className="rounded-2xl border border-border bg-card/40 p-3">
+    <div className="shrink-0 rounded-2xl border border-border bg-card/40 p-3">
       <div className="flex flex-wrap items-center gap-1">
         {pipeline.state === "running" && <Loader2 className="mr-1 size-4 animate-spin text-primary" />}
         {pipeline.state === "paused" && <PauseCircle className="mr-1 size-4 text-amber-400" />}
@@ -93,7 +93,7 @@ export function PipelineBar() {
       )}
 
       {project.pending_bindings.length > 0 && (
-        <div className="mt-2 space-y-1.5">
+        <div className="mt-2 max-h-36 space-y-1.5 overflow-y-auto pr-1">
           {project.pending_bindings.map((pb) => {
             const material = project.materials.find((m) => m.id === pb.material_id);
             const suggested = project.scenes.find((s) => s.id === pb.suggested_scene_id);

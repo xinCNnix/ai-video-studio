@@ -29,14 +29,16 @@ from .. import generation_service, material_match, project_store, voice_service
 NORMALIZE_CHUNK_CHARS = 3500
 PLAN_BATCHHint = 8  # 提示模型单批输出规模上限
 PLAN_MAX_BATCHES = 25  # 200 镜安全上限
+PLAN_GUARD_RETRIES = 2  # storyboard 保真闸门：镜数≠拍数时的纠错重规划次数
 BIND_CONFIDENCE_THRESHOLD = 0.7
 
 NORMALIZE_SYSTEM = """你是剧本结构化引擎。把剧本解析为标准 JSON 结构（只输出 JSON，不要任何解释文字）。
 
 剧本类型判定（script_type）：
 - story: 故事文本/小说片段（无镜头语言）→ 由你拆成多个叙事节拍，一拍 3-8 秒画面
-- screenplay: 标准剧本（场景标题/动作/对话）→ 每场拆成 1 个或多个节拍
-- storyboard: 用户已有分镜表/分镜稿 → 逐镜对录：一镜一拍，严禁合并、拆分、改写、增删
+- screenplay: 标准编剧格式剧本（场景标题/动作/对话，如"内景-白天-诊室"）→ 每场拆成 1 个或多个节拍
+- storyboard: 用户已有的成稿分镜。特征：分镜表、带镜头号的镜头列表、"片段N/第N镜/镜头N/分镜N"编号的段落、
+  或"全局统一设定 + 逐段画面描述"结构（每段就是一个定稿镜头）→ 逐镜对录：一镜一拍，严禁合并、拆分、改写、增删
 - ad: 广告/口播稿 → 按卖点与钩子分拍
 - materials_only: 只有素材说明、没有剧本正文
 
@@ -48,12 +50,18 @@ NORMALIZE_SYSTEM = """你是剧本结构化引擎。把剧本解析为标准 JSO
 
 规则：
 - beats 严格按播放顺序；description 写"镜头里能看见什么"；narration 写"这一拍说什么"，原文有台词就用原文
-- storyboard 类型必须逐镜对录：narration/description 忠实摘录原文，source_hint 保留原句；用户写了镜头号/时长的在 description 里保留
+- storyboard 类型必须逐镜对录：narration/description 忠实摘录原文，source_hint 保留原句；用户写了镜头号/时长的在 description 里保留；beats 数必须等于用户的镜数，一镜不多、一镜不少
 - characters 只列有戏份的主体角色，design 是跨镜一致性的外观锚点（发型/服装/年龄/体态）
 - 没有角色/台词的纯风光片，characters 可为空数组
-- beats 至少 1 拍；宁多勿漏，后续阶段会再规划分镜"""
+- beats 至少 1 拍；story 类型宁多勿漏（后续阶段会再规划分镜）；storyboard 类型拍数守恒，绝不多拍也绝不漏拍"""
 
 PLAN_SYSTEM = """你是分镜规划师。把剧本节拍规划成可执行的视频分镜，只输出 JSON。
+
+剧本类型规则（script_type 附在用户消息开头，必须遵守）：
+- storyboard（用户分镜已成稿）：一拍一镜，分镜总数必须严格等于节拍数。
+  title/description/narration 忠实取自对应拍；prompt 只做技术性扩写
+  （Action Timeline/素材声明/声音设计），严禁增加、删除、拆分、合并镜头，严禁虚构原稿没有的画面情节
+- story / screenplay / ad / materials_only：节拍是创作素材，可一拍一镜或一拍多镜，按叙事需要规划
 
 每镜字段：
 - title: ≤20字
@@ -289,39 +297,72 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
     if not project.screenplay:
         raise FatalError("项目缺少剧本结构（screenplay），请先执行 normalize 阶段")
     beats = project.screenplay.get("beats") or []
+    if not beats:
+        raise FatalError("剧本节拍为空，无法规划分镜（请检查 normalize 阶段产出）")
+    script_type = str(project.screenplay.get("script_type") or "")
+    is_storyboard = script_type == "storyboard"
     manifest = materials_manifest(project)
     constraints = _model_constraints(project)
     chars = project.screenplay.get("characters") or []
 
+    type_note = (
+        f"剧本类型：storyboard（用户分镜已成稿，共 {len(beats)} 拍）→ 一拍一镜，必须恰好输出 {len(beats)} 镜，"
+        "逐拍对录，严禁增删拆合与虚构画面"
+        if is_storyboard else
+        f"剧本类型：{script_type or 'unknown'} → 节拍是创作素材，可按叙事需要规划分镜"
+    )
     beats_text = "\n".join(
         f"{i + 1}. [{b.get('title') or ''}] 画面：{b.get('description') or ''}｜旁白：{b.get('narration') or ''}"
         for i, b in enumerate(beats)
     )
     base_user = (
-        f"视频模型约束：{constraints}\n\n角色设定（跨镜一致，Prompt 中需体现或用参考图锚定）：\n"
+        f"{type_note}\n\n视频模型约束：{constraints}\n\n角色设定（跨镜一致，Prompt 中需体现或用参考图锚定）：\n"
         + ("\n".join(f"- {c['name']}：{c['design']}" for c in chars) or "（无）")
         + f"\n\n素材清单（需引用素材时用 material_id）：\n{manifest}\n\n剧本节拍（按播放顺序，共 {len(beats)} 拍）：\n{beats_text}\n\n"
-        f"规划全部分镜。先输出发音完整的前 {PLAN_BATCHHint} 镜（done=false），后续我会要求继续。"
+        f"规划全部分镜。总数不超过 {PLAN_BATCHHint} 镜时一次性全部输出（done=true）；"
+        f"更多时先输出发音完整的前 {PLAN_BATCHHint} 镜（done=false），后续我会要求继续。"
     )
 
     from .schemas import PlanBatch
 
-    all_shots: list[dict] = []
-    messages_extra = ""
-    for batch_no in range(PLAN_MAX_BATCHES):
-        user = base_user if batch_no == 0 else (
-            f"继续输出分镜。已输出 {len(all_shots)} 镜：\n"
-            + "\n".join(f"- {i + 1}. {s['title']}" for i, s in enumerate(all_shots))
-            + f"\n\n请从第 {len(all_shots) + 1} 镜继续，单批最多 {PLAN_BATCHHint} 镜，全部输出完时 done=true。{messages_extra}"
-        )
-        batch = await envelope.structured_call(PLAN_SYSTEM, user, PlanBatch)
-        all_shots.extend(s.model_dump() for s in batch.shots)
-        if trace:
-            trace.log("plan_batch", batch=batch_no + 1, got=len(batch.shots), total_planned=batch.total, done=batch.done)
-        if batch.done or not batch.shots:
-            break
+    async def collect_batches(extra_note: str = "") -> list[dict]:
+        base = base_user + (f"\n\n{extra_note}" if extra_note else "")
+        shots: list[dict] = []
+        for batch_no in range(PLAN_MAX_BATCHES):
+            user = base if batch_no == 0 else (
+                f"继续输出分镜。已输出 {len(shots)} 镜：\n"
+                + "\n".join(f"- {i + 1}. {s['title']}" for i, s in enumerate(shots))
+                + f"\n\n请从第 {len(shots) + 1} 镜继续，单批最多 {PLAN_BATCHHint} 镜，全部输出完时 done=true。"
+            )
+            batch = await envelope.structured_call(PLAN_SYSTEM, user, PlanBatch, max_tokens=16384)
+            shots.extend(s.model_dump() for s in batch.shots)
+            if trace:
+                trace.log("plan_batch", batch=batch_no + 1, got=len(batch.shots), total_planned=batch.total, done=batch.done)
+            if batch.done or not batch.shots:
+                break
+        return shots
+
+    all_shots = await collect_batches()
     if not all_shots:
         raise FatalError("plan 阶段没有产出任何分镜")
+
+    # storyboard 保真闸门：镜数必须等于拍数。提示词约束可能被模型无视，这里确定性把关——
+    # 不满足时带纠错反馈重规划，仍失败则干净报错，绝不把扩写结果静默落盘
+    if is_storyboard:
+        for attempt in range(1, PLAN_GUARD_RETRIES + 1):
+            if len(all_shots) == len(beats):
+                break
+            if trace:
+                trace.log("plan_guard_retry", attempt=attempt, expected=len(beats), got=len(all_shots))
+            all_shots = await collect_batches(
+                f"【数量错误】上一轮输出了 {len(all_shots)} 镜，但用户分镜稿共 {len(beats)} 镜（一拍一镜）。"
+                f"必须恰好输出 {len(beats)} 镜：逐拍对录，不得增加、删除、拆分、合并。"
+            )
+        if len(all_shots) != len(beats):
+            raise FatalError(
+                f"storyboard 保真校验失败：用户分镜 {len(beats)} 镜，规划产出 {len(all_shots)} 镜"
+                f"（已纠错重试 {PLAN_GUARD_RETRIES} 轮），已中止且未落盘；请重试或改用对话方式调整分镜"
+            )
 
     vmodel = generation_service.resolve_video_model(project.settings.video_model)
     modes = set(vmodel.get("modes") or ["text", "image", "reference"])

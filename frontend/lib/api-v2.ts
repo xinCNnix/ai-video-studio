@@ -113,6 +113,24 @@ export interface AgentV2Event {
   reply?: string;
 }
 
+type RawAgentEvent = {
+  type?: string;
+  step?: { type?: string; tool?: string; ok?: boolean; text?: string };
+  result?: unknown;
+  message?: string;
+};
+
+/** 后端 SSE 是旧协议（step 载荷嵌在 step 字段、终点事件叫 final），这里归一成 AgentV2Event。 */
+function normalizeAgentEvent(evt: RawAgentEvent): AgentV2Event {
+  if (evt.type === "step") {
+    const s = evt.step ?? {};
+    if (s.type === "route") return { type: "route", mode: (s.text ?? "").replace(/^路由：/, "") };
+    return { type: "step", tool: s.tool, ok: typeof s.ok === "boolean" ? s.ok : undefined };
+  }
+  const r = (evt.result ?? {}) as { reply?: string };
+  return { type: "done", result: evt.result, reply: typeof r.reply === "string" ? r.reply : undefined };
+}
+
 export async function runAgentV2Stream(
   body: { goal: string; project_id?: string | null; scene_id?: string | null; model?: string | null; credential_id?: string | null },
   onEvent: (e: AgentV2Event) => void,
@@ -135,11 +153,14 @@ export async function runAgentV2Stream(
     for (const part of parts) {
       const line = part.split("\n").find((l) => l.startsWith("data: "));
       if (!line) continue;
+      let evt: RawAgentEvent;
       try {
-        onEvent(JSON.parse(line.slice(6)));
+        evt = JSON.parse(line.slice(6)) as RawAgentEvent;
       } catch {
-        /* ignore */
+        continue;
       }
+      if (evt.type === "error") throw new Error(evt.message || "Agent 运行失败");
+      onEvent(normalizeAgentEvent(evt));
     }
   }
 }

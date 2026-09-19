@@ -31,7 +31,7 @@ export default function StudioPage() {
   const exportProject = useStudioV2Store((s) => s.exportProject);
   const exporting = useStudioV2Store((s) => s.exporting);
 
-  const [videoModels, setVideoModels] = useState<{ id: string; label: string }[]>([]);
+  const [videoModels, setVideoModels] = useState<{ id: string; label: string; resolutions?: string[] }[]>([]);
 
   useEffect(() => {
     void ensureLoaded();
@@ -64,7 +64,7 @@ export default function StudioPage() {
   useEffect(() => {
     void fetch(`${process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000"}/api/settings/catalog`)
       .then((r) => r.json())
-      .then((d: { video?: { id: string; label: string }[] }) => setVideoModels(d.video ?? []))
+      .then((d: { video?: { id: string; label: string; resolutions?: string[] }[] }) => setVideoModels(d.video ?? []))
       .catch(() => undefined);
   }, []);
 
@@ -94,8 +94,10 @@ export default function StudioPage() {
 
   const doneCount = project.scenes.filter((s) => s.assets.video).length;
 
+  // 外壳布局没有高度约束（body 需保持可滚动以兼容其他页面），这里直接锚定视口：
+  // Topbar 高 3.5rem，页面占余下高度，子列才能真正内部滚动
   return (
-    <div className="flex h-full min-h-0 flex-col">
+    <div className="flex h-[calc(100dvh-3.5rem)] min-h-0 flex-col">
       {/* 顶栏：项目 / 画幅 / 视频模型 / 全自动 / 导出 */}
       <div className="flex flex-wrap items-center gap-2 border-b border-border px-4 py-2.5">
         <select
@@ -112,7 +114,11 @@ export default function StudioPage() {
         </select>
         <button
           type="button"
-          onClick={() => void createProject().then((n) => toast.success(`已新建项目「${n}」`))}
+          onClick={() => {
+            const name = window.prompt("新建项目名称", "未命名项目");
+            if (name === null) return;
+            void createProject(name).then((n) => toast.success(`已新建项目「${n}」`));
+          }}
           className="inline-flex cursor-pointer items-center gap-1 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs hover:bg-secondary/60"
         >
           <Plus className="size-3.5" /> 新建
@@ -143,6 +149,26 @@ export default function StudioPage() {
             {a}
           </button>
         ))}
+
+        {(() => {
+          const current = project.settings.resolution || "auto";
+          const tiers = videoModels.find((m) => m.id === project.settings.video_model)?.resolutions ?? ["auto"];
+          const options = tiers.includes(current) ? tiers : [current, ...tiers];
+          return (
+            <select
+              value={current}
+              onChange={(e) => void patchSettings({ resolution: e.target.value })}
+              className="h-8 cursor-pointer rounded-lg border border-border bg-card px-2 text-xs outline-none"
+              title="分辨率（auto=按画幅用默认档位；对之后新生成的分镜生效，档位随所选视频模型变化）"
+            >
+              {options.map((r) => (
+                <option key={r} value={r}>
+                  分辨率：{r}
+                </option>
+              ))}
+            </select>
+          );
+        })()}
 
         <select
           value={project.settings.video_model ?? ""}

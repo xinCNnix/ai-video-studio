@@ -422,9 +422,11 @@ class AgentV2:
         if tool == "run_pipeline":
             from .pipeline import start_pipeline
             payload = {"script_text": args.get("script_text") or "", "materials": args.get("materials") or []}
+            self._handoff_to_pipeline()
             return start_pipeline(self.project_id, payload, self.credential_id, self.model)
         if tool == "advance_pipeline":
             from .pipeline import advance_pipeline
+            self._handoff_to_pipeline()
             return advance_pipeline(self.project_id, confirmed=bool(args.get("confirmed", True)))
         if tool == "export_project":
             try:
@@ -462,15 +464,26 @@ class AgentV2:
 
     # ---------- 确定性直通（零 LLM） ----------
 
+    def _handoff_to_pipeline(self) -> None:
+        """把项目运行锁交还给流水线。
+
+        start/advance_pipeline 与 agent 共用 single-flight 锁；agent 持锁调用必然
+        RunBusyError（"已有任务在进行中"的死锁）。release 按 run_id 匹配，只放掉
+        自己的锁；交接后 run_agent_v2 的 finally release 因 run_id 不匹配自动空转，
+        不会误删流水线新持有的锁。"""
+        if self.project_id:
+            watchdog.release(self.project_id, self.run_id)
+
     async def _direct_pipeline_start(self, project) -> dict:
         from .pipeline import start_pipeline
 
         attachments = _extract_attachments(self.goal)
         payload = {"script_text": _strip_attachment_block(self.goal), "materials": attachments}
+        self._handoff_to_pipeline()
         try:
             r = start_pipeline(self.project_id, payload, self.credential_id, self.model)
-        except RunBusyError as exc:
-            return {"reply": f"该项目已有任务在进行中，请稍候再试。", "jobs": [], "run_id": self.run_id}
+        except RunBusyError:
+            return {"reply": "该项目已有任务在进行中，请稍候再试。", "jobs": [], "run_id": self.run_id}
         reply = (
             "已启动流水线：剧本解析 → 分镜规划 → 素材分配，完成后会在确认面板等你确认再生成。"
             "进度实时显示在分镜看板上。"
@@ -482,6 +495,7 @@ class AgentV2:
     async def _direct_pipeline_advance(self) -> dict:
         from .pipeline import advance_pipeline
 
+        self._handoff_to_pipeline()
         r = advance_pipeline(self.project_id, confirmed=True)
         return {
             "reply": "已继续流水线（确认门禁按你的指令放行）：补齐缺口并逐镜生成，完成后自动导出成片。",

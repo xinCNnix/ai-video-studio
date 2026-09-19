@@ -79,12 +79,13 @@ def parse_json_candidates(text: str) -> list[dict]:
     """提取文本中所有能解析成 dict 的 {...}（容忍字符串值里的真实换行）。"""
     out: list[dict] = []
     for frag in scan_json_objects(text):
+        parsed = None
         for cand in (frag, repair_json_literals(frag)):
             try:
                 parsed = json.loads(cand)
-                break
             except json.JSONDecodeError:
                 continue
+            break
         if isinstance(parsed, dict):
             out.append(parsed)
     return out

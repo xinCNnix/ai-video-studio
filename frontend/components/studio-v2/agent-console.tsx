@@ -2,9 +2,10 @@
 
 /** Agent 控制台：对话 + 步骤流展示（SSE）。创作类请求由后端路由直通流水线。 */
 import { useEffect, useRef, useState } from "react";
-import { Bot, Loader2, Send, User, Wrench } from "lucide-react";
+import { Bot, Eraser, Loader2, Send, User, Wrench } from "lucide-react";
 import { runAgentV2Stream } from "@/lib/api-v2";
 import { useStudioV2Store } from "@/stores/studio-v2-store";
+import { MdText } from "@/components/studio-v2/md-text";
 import { cn } from "@/lib/utils";
 
 interface Msg {
@@ -13,12 +14,45 @@ interface Msg {
   steps?: { tool?: string; ok?: boolean; note?: string }[];
 }
 
+/** 超长消息（粘贴的剧本等）折叠显示，避免撑爆控制台。 */
+const LONG_LINES = 8;
+const LONG_CHARS = 300;
+
+function MsgBubble({ m }: { m: Msg }) {
+  const [open, setOpen] = useState(false);
+  const isLong = m.text.length > LONG_CHARS || m.text.split("\n").length > LONG_LINES;
+  const text =
+    isLong && !open
+      ? `${m.text.split("\n").slice(0, LONG_LINES).join("\n").slice(0, LONG_CHARS)}…`
+      : m.text;
+  return (
+    <div
+      className={cn(
+        "inline-block max-w-[92%] rounded-xl px-3 py-2 text-left text-xs leading-relaxed",
+        m.role === "user" ? "whitespace-pre-wrap bg-primary/15 text-primary-foreground" : "bg-secondary/50",
+      )}
+    >
+      {m.role === "user" ? text : <MdText text={text} />}
+      {isLong && (
+        <button
+          type="button"
+          onClick={() => setOpen(!open)}
+          className="mt-1 block cursor-pointer text-[10px] text-primary/80 hover:underline"
+        >
+          {open ? "收起" : `展开全部（${m.text.length} 字）`}
+        </button>
+      )}
+    </div>
+  );
+}
+
 export function AgentConsole() {
   const project = useStudioV2Store((s) => s.project);
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -28,18 +62,26 @@ export function AgentConsole() {
     const goal = (text ?? input).trim();
     if (!goal || running || !project) return;
     setInput("");
+    if (inputRef.current) inputRef.current.style.height = "auto";
     setMessages((m) => [...m, { role: "user", text: goal }]);
     setRunning(true);
     const steps: Msg["steps"] = [];
     let reply = "";
     try {
       await runAgentV2Stream({ goal, project_id: project.id }, (e) => {
+        if (e.type === "route") {
+          steps.push({ note: `路由：${e.mode ?? ""}` });
+          setMessages((m) => [...m]);
+        }
         if (e.type === "step" && e.tool) {
-          steps.push({ tool: e.tool, ok: e.ok });
+          // 同一工具后端发两次：执行前（无 ok）与执行后（带 ok），合并为一行
+          const last = steps[steps.length - 1];
+          if (last && last.tool === e.tool && last.ok === undefined) last.ok = e.ok ?? true;
+          else steps.push({ tool: e.tool, ok: e.ok });
           setMessages((m) => [...m]);
         }
         if (e.type === "done") {
-          reply = (e.result as { reply?: string } | undefined)?.reply ?? e.reply ?? "（完成）";
+          reply = (e.result as { reply?: string } | undefined)?.reply ?? e.reply ?? "";
         }
       });
       setMessages((m) => [...m, { role: "assistant", text: reply || "（完成）", steps: [...steps] }]);
@@ -55,6 +97,16 @@ export function AgentConsole() {
       <div className="flex items-center gap-2 border-b border-border px-4 py-3 text-sm font-semibold">
         <Bot className="size-4 text-primary" />
         Agent 控制台
+        <div className="flex-1" />
+        <button
+          type="button"
+          onClick={() => setMessages([])}
+          disabled={messages.length === 0 || running}
+          title="清除当前对话（只清空界面显示，不影响项目与流水线状态）"
+          className="cursor-pointer rounded-md border border-border bg-card p-1.5 text-muted-foreground hover:bg-secondary/60 hover:text-foreground disabled:opacity-40"
+        >
+          <Eraser className="size-3.5" />
+        </button>
       </div>
       <div className="flex-1 space-y-3 overflow-y-auto p-3">
         {messages.length === 0 && (
@@ -64,21 +116,18 @@ export function AgentConsole() {
         )}
         {messages.map((m, i) => (
           <div key={i} className={cn("space-y-1", m.role === "user" ? "text-right" : "text-left")}>
-            <div
-              className={cn(
-                "inline-block max-w-[92%] rounded-xl px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap text-left",
-                m.role === "user" ? "bg-primary/15 text-primary-foreground" : "bg-secondary/50",
-              )}
-            >
-              {m.text}
-            </div>
+            <MsgBubble m={m} />
             {m.steps && m.steps.length > 0 && (
               <div className="space-y-0.5 text-left">
                 {m.steps.map((s, j) => (
                   <div key={j} className="flex items-center gap-1 text-[10px] text-muted-foreground">
                     <Wrench className="size-2.5" />
-                    {s.tool}
-                    <span className={s.ok === false ? "text-red-400" : "text-emerald-400"}>{s.ok === false ? "✕" : "✓"}</span>
+                    {s.tool ?? s.note}
+                    {s.tool && (
+                      <span className={s.ok === false ? "text-red-400" : "text-emerald-400"}>
+                        {s.ok === false ? "✕" : "✓"}
+                      </span>
+                    )}
                   </div>
                 ))}
               </div>
@@ -112,14 +161,26 @@ export function AgentConsole() {
           </button>
         </div>
         <div className="flex gap-1.5">
-          <div className="flex flex-1 items-center gap-1.5 rounded-lg border border-border bg-background/60 px-2.5">
-            <User className="size-3.5 shrink-0 text-muted-foreground" />
-            <input
+          <div className="flex flex-1 items-start gap-1.5 rounded-lg border border-border bg-background/60 px-2.5">
+            <User className="mt-2.5 size-3.5 shrink-0 text-muted-foreground" />
+            <textarea
+              ref={inputRef}
               value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => e.key === "Enter" && !e.nativeEvent.isComposing && void send()}
-              placeholder="输入指令或粘贴剧本…"
-              className="h-9 min-w-0 flex-1 bg-transparent text-xs outline-none"
+              onChange={(e) => {
+                setInput(e.target.value);
+                const el = e.target;
+                el.style.height = "auto";
+                el.style.height = `${Math.min(el.scrollHeight, 112)}px`;
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+                  e.preventDefault();
+                  void send();
+                }
+              }}
+              rows={1}
+              placeholder="输入指令或粘贴剧本…（Shift+Enter 换行）"
+              className="max-h-28 min-h-9 w-full resize-none bg-transparent py-2 text-xs outline-none"
             />
           </div>
           <button

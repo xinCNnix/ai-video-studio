@@ -220,6 +220,11 @@ def start_pipeline(project_id: str, payload: dict | None = None,
     trace = trace_mod.RunTrace(run_id, project_id, "pipeline",
                                meta={"goal": ((payload or {}).get("script_text") or "")[:200]})
 
+    # 运行锁在改状态前获取：冲突时立即报错，且不会给项目留下悬空的 running 状态
+    if not watchdog.try_acquire(project_id, run_id, "pipeline"):
+        active = watchdog.current(project_id)
+        raise RunBusyError("该项目已有进行中的任务", active_run=active)
+
     def fn(p) -> None:
         p.pipeline.history = []
         p.pipeline.stage = "intake"
@@ -229,10 +234,6 @@ def start_pipeline(project_id: str, payload: dict | None = None,
         p.pipeline.run_id = run_id
 
     project_store.mutate(project_id, fn)
-    # 运行锁在同步段获取：冲突时立即向调用方报错，不产生静默空跑的后台任务
-    if not watchdog.try_acquire(project_id, run_id, "pipeline"):
-        active = watchdog.current(project_id)
-        raise RunBusyError("该项目已有进行中的任务", active_run=active)
     task = asyncio.create_task(_execute(project_id, run_id, trace, payload, credential_id, model))
     task.add_done_callback(_log_task_error)
     return {"ok": True, "run_id": run_id}
