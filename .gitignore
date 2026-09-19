@@ -1,0 +1,38 @@
+# dependencies / builds
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+backend/.venv/
+**/__pycache__/
+
+# 本地数据（加密 Key、生成结果、任务、项目）
+data/config/secret.key
+data/config/providers.enc
+data/config/app_settings.json
+data/config/custom_models.json
+data/config/voice_assets.json
+data/jobs/*
+data/outputs/*
+data/uploads/*
+data/temp/*
+data/projects/*
+data/projects_archive/*
+data/runs/*
+data/presets/*
+data/voices/*
+data/logs/*
+
+# 调试产物与历史快照
+backup/
+repro/
+repro_backup_check/
+gui-test-screenshots/
+*.log
+batch_ids.txt
+*.csv
+m10.json
+r10.json
+.video_agent/
+
+env
+.env*.local
