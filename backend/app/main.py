@@ -6,6 +6,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
 from .api import agent as agent_api
+from .api import agent_v2 as agent_v2_api
 from .api import files as files_api
 from .api import image as image_api
 from .api import jobs as jobs_api
@@ -60,6 +61,7 @@ for router in (
     projects_api.router,
     projects_v2_api.router,
     agent_api.router,
+    agent_v2_api.router,
     files_api.router,
 ):
     app.include_router(router)
