@@ -1,4 +1,4 @@
-import type { Credential, Job, ModelCatalog, Project, ProjectSummary, VoiceAsset } from "./types";
+import type { Credential, Job, ModelCatalog, VoiceAsset } from "./types";
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000";
 
@@ -283,15 +283,6 @@ export const api = {
   },
   deleteJob: (id: string) => request<{ ok: boolean }>(`/api/jobs/${id}`, { method: "DELETE" }),
 
-  // 项目
-  listProjects: () => request<{ projects: ProjectSummary[] }>("/api/projects"),
-  createProject: (name: string) =>
-    request<Project>("/api/projects", { method: "POST", body: JSON.stringify({ name }) }),
-  getProject: (id: string) => request<Project>(`/api/projects/${id}`),
-  saveProject: (id: string, body: { name?: string; aspect_ratio?: string; scenes: unknown[] }) =>
-    request<Project>(`/api/projects/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteProject: (id: string) => request<{ ok: boolean }>(`/api/projects/${id}`, { method: "DELETE" }),
-
   // Agent
   agentChat: (body: {
     message: string;
@@ -359,13 +350,7 @@ export const api = {
     if (!final) throw new Error("Agent 连接中断，未收到最终结果（已提交的后台任务不受影响）");
     return final;
   },
-  cancelAgent: () => request<{ ok: boolean }>("/api/agent/cancel", { method: "POST" }),
-  exportProject: (id: string) =>
-    request<{ url: string; scenes_exported: number; scenes_skipped: number[] }>(
-      `/api/projects/${id}/export`,
-      { method: "POST" }
-    ),
-};
+  cancelAgent: () => request<{ ok: boolean }>("/api/agent/cancel", { method: "POST" }),};
 
 export async function pollJob(
   jobId: string,

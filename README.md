@@ -1,119 +1,120 @@
-# AI Video Studio —— AI 视频生成整合工作台 v1.0
+# AI Video Studio —— AI 视频生成整合工作台 v2.0
 
-按《AI 视频生成整合工作台 软件开发设计书 v1.0》实现的完整可运行项目。
+> 定位：**Agent-First 的多模型视频生成工作台**。
+> Studio 以 Agent/流水线为主控：投放任意格式剧本 → 自动拆分镜 → 精确分配参考图/参考音频 → 确认后逐镜生成 → 拼接成片。
+> 稳定性由 **Agent Harness 工程层**保证（模型不可信，骨架兜底），不依赖 prompt 和模型自觉。
 
-> 定位：**一个拥有 AI Prompt 辅助能力的多模型视频生成工作台**。
-> 用一个统一、精美、易用的前端界面整合 LLM、TTS、生图模型和视频生成模型；各模块无强依赖，可单独使用。
-
-## 技术方案（与设计书一致）
+## 技术方案
 
 | 层 | 技术 |
 | --- | --- |
 | 前端 | Next.js 15（App Router）+ TypeScript + Tailwind CSS v4 + shadcn/ui 风格组件 + Zustand |
-| 后端 | Python venv + FastAPI + Pydantic + httpx + cryptography + aiofiles |
+| 后端 | Python venv + FastAPI + Pydantic v2 + httpx + cryptography + aiofiles |
 | 存储 | 无数据库，全部本地文件 `data/`（Key 使用 AES-256-GCM 整体加密） |
 
-## 目录结构
+## v2 架构（Studio + Agent 重构）
 
 ```
-video_gener_agent/
-├── backend/                  # FastAPI 后端（.venv 虚拟环境在本目录内）
-│   ├── .venv/
-│   ├── requirements.txt
-│   └── app/
-│       ├── main.py           # FastAPI 入口（127.0.0.1:8000）
-│       ├── api/              # prompt / image / voice / video / jobs / projects / settings / agent / files
-│       ├── providers/        # 模型适配器
-│       │   ├── llm/openai_compatible.py     # OpenAI 兼容 LLM（MiniMax / OpenAI / 自定义）
-│       │   ├── image/openai_image.py        # OpenAI 生图（gpt-image-1 / dall-e-3）
-│       │   ├── tts/minimax_tts.py           # MiniMax TTS (t2a_v2)
-│       │   └── video/minimax_h3.py          # MiniMax H3 视频（submit + 轮询）
-│       │       └── generic_video.py         # 通用视频 API（POST /videos 模式）
-│       ├── services/         # prompt / image / voice / video / project / file
-│       ├── jobs/manager.py   # JobManager：job_id + data/jobs/{id}.json，无需 Celery
-│       ├── config/           # settings.py（模型目录）+ key_manager.py（AES 加密）
-│       └── prompt/           # h3_prompt.py / generic_prompt.py（系统提示词）
-├── frontend/                 # Next.js 前端（127.0.0.1:3000）
-│   ├── app/                  # 首页 / prompt / image / voice / video / studio / settings
-│   ├── components/           # layout / prompt / image / voice / video / studio / common / agent / ui
-│   ├── stores/               # app-store.ts / studio-store.ts（Zustand）
-│   └── lib/                  # api.ts / types.ts / utils.ts
-├── data/                     # 运行时数据（自动创建）
-│   ├── config/providers.enc  # 加密的 API Key
-│   ├── uploads/{image,audio,video}/
-│   ├── outputs/{image,audio,video}/
-│   ├── jobs/                 # 每个任务一个 JSON
-│   ├── projects/             # Studio 项目
-│   └── presets/              # Prompt 预设
-└── start.bat                 # 一键启动
+用户投放剧本+素材（IntakePanel / Agent 对话）
+  ↓ POST /api/projects/{id}/pipeline/start
+pipeline 状态机（services/pipeline/，跑在 harness 之上）：
+  intake(纯代码) → normalize(LLM信封) → plan(LLM信封) → bind(确定性+LLM兜底)
+  → review 门禁(默认暂停等确认) → generate(声明式调谐) → assemble(ffmpeg)
+  ↓ 每阶段 checkpoint 持久化，崩溃可续跑；全部 LLM 输出过 schema 校验信封
+generation_service（唯一生成入口：手动按钮 = agent 工具 = 流水线，规则只有一份）
+  ↓ 写回只经 project_store（版本乐观锁），结果经 SSE 实时推送前端
 ```
+
+### Harness 层（backend/app/harness/，稳定性核心）
+
+| 模块 | 机制 |
+| --- | --- |
+| `errors.py` | 错误三分类：Retryable（自动重试）/ Fatal（干净中止，保留产物）/ NeedsUserInput（进确认面板，绝不瞎猜） |
+| `state.py` | 项目 v2 Pydantic 模型 + 写入口不变量：非法状态（素材引用不存在、音频>3段、时长越界）在落盘前拒绝 |
+| `llm 信封`（pipeline/llm_client.py） | 结构化调用：JSON 解析（围栏/混排/字符串换行容忍）→ schema 校验 → 错误回喂修复×2 → 网络退避重试×3 |
+| `checkpoint.py` | 阶段进度持久化在项目本身；断点续跑；悬空 running 由看门狗转 paused |
+| `watchdog.py` | 项目级 single-flight 运行锁 + 心跳：同项目同时只允许一个 agent/pipeline run，卡死判死 |
+| `trace.py` | run 级事件溯源账本 `data/runs/*.jsonl`：每次 LLM 调用/修复/工具/阶段全在案，可回放 |
+| `reconcile.py`（services/） | 声明式调谐器：每镜期望资产 vs 实际资产求差 → 幂等提交（去重键）→ 失败自动重试 ≤2 次 → 耗尽转 failed |
+
+### 关键设计决策
+
+- **素材先于分镜**：plan 阶段的 LLM 输入就带完整素材清单（id/类型/文件名台词/时长），分镜直接声明要哪些素材；bind 阶段确定性对号 + LLM 兜底带置信度，低置信进 `pending_bindings` 由用户确认——参考图绝不再"挂到全部分镜"
+- **单一代码路径**：关键帧/配音/视频生成只有 generation_service 一份实现（mode 判定、`<Audio N>` 重编号、契约校验、时长钳制、模型选择全部单点）；视频模型取自项目设置，不再硬编码目录第一项
+- **单一事实源**：前端是命令发送端 + SSE 视图（无全量 PUT、无本地编辑副本），409 冲突自动刷新重放；消灭前后端双写竞态
+- **任意剧本格式**：normalize 阶段先判别类型（故事/标准剧本/已有分镜表/广告口播/仅素材）再逐类抽取，长剧本确定性分块（输入侧分块，杜绝输出被 max_tokens 截断整段丢失）
+- **review 门禁**：分镜+素材分配完成后默认暂停等用户确认再生成（会消耗额度）；项目设置可开"全自动"
+- **幂等与断点**：任意阶段 kill 进程可从检查点续跑；视频任务带云端任务号，服务重启自动续轮询并按 Prompt 指纹写回
+- **导出修复**：无旁白分镜自动补静音轨，concat 不再因音轨不一致失败；ffmpeg 带超时
+
+## 目录结构（主要变化）
+
+```
+backend/app/
+├── harness/                  # ★ 稳定性工程层（errors/bus/trace/checkpoint/watchdog/state）
+├── services/
+│   ├── pipeline/             # ★ 流水线：llm_client(信封) / schemas / stages / 状态机
+│   ├── project_store.py      # ★ v2 唯一写入口（乐观锁+不变量+事件）
+│   ├── generation_service.py # ★ 统一生成入口
+│   ├── reconcile.py          # ★ 声明式调谐器（generate 阶段引擎）
+│   ├── agent_v2.py           # ★ 瘦工具循环（路由直通 + 熔断 + 取消）
+│   └── material_match.py     # ★ 素材↔分镜确定性匹配（同台词去重/台词对号/标签重编号）
+├── api/                      # projects(命令式+SSE) / agent_v2 / 其余工具页不动
+├── providers/ config/ jobs/  # 适配器/加密/任务（未变更）
+frontend/
+├── app/studio/               # ★ agent-first 新布局
+├── components/studio-v2/     # ★ intake/pipeline-bar/shot-board/shot-drawer/agent-console
+├── stores/studio-v2-store.ts # ★ SSE 订阅 + 命令发送（无 save()）
+└── lib/api-v2.ts types-v2.ts # ★ v2 客户端与类型
+```
+
+数据目录新增：`data/runs/`（run trace 账本）、`data/projects_archive/`（v1 项目自动归档，只读保留）。
 
 ## 启动
 
 ```bat
-:: 方式一：静默启动（推荐，无命令行窗口）
-:: 双击 start-hidden.vbs —— 后台启动两个服务并自动打开浏览器
-:: 日志输出到 data\logs\backend.log 和 frontend.log
-:: 停止：双击 stop.bat
-
-:: 方式二：可见窗口启动（想实时看日志时用）
-start.bat
-
-:: 方式三：手动
-:: 后端（首次需先创建 venv）
-cd backend
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8000
-
-:: 前端
-cd frontend
-npm install
-npm run dev
+:: 方式一：静默启动（推荐）—— 双击 start-hidden.vbs；停止：stop.bat
+:: 方式二：可见窗口 —— start.bat
 ```
 
-打开 http://127.0.0.1:3000 。后端接口文档：http://127.0.0.1:8000/docs
+打开 http://127.0.0.1:3000 ，后端文档 http://127.0.0.1:8000/docs 。
 
-## 使用流程
+## 使用流程（Studio 为核心）
 
-1. **设置 → API Keys**：添加厂商 Key（MiniMax / OpenAI / OpenAI Compatible / Generic Video API）。
-   Key 加密存于 `data/config/providers.enc`，前端只显示掩码；可添加多 Key 并指定默认，支持 Test Connection。
-2. **AI 视频**（核心页）：Model / Credential / Mode（Text・Image・Reference）/ Prompt（右上 `AI` 一键改写）/
-   Duration（**1-15 秒滑杆任选**）/ Aspect / Resolution → Generate Video。
-   中央预览随比例自适应（9:16 竖屏 / 16:9 横屏），生成状态只显示真实阶段（Submitted → Generating → Downloading，不虚构百分比），
-   右侧 History 保存全部历史，点击即切回预览。
-3. **AI Prompt**：输入创意 → 选择 Prompt Mode 与 Target Video Model（MiniMax H3 / Generic）→ 生成结构化 Prompt
-   （Scene / Subject / Action Timeline / Camera / … / Constraints 分节展示），支持 Shorter・More Detailed・Improve Motion・
-   Improve Camera・Improve Timing・Regenerate，可 Copy / Save / Send to Video。
-4. **AI 图片**：Prompt + 参考图拖拽 + 比例 → 生成；结果悬浮提供 Download / Use as Reference / Send to Video。
-5. **AI 语音**：文案 + 音色 / 语速 / 情感 → 大型播放器试听，Download / Send to Studio。
-   声音克隆上传样本即音色：小米侧样本随身（每次请求 base64 锚定），配置 MiniMax Key 后可勾选
-   **同时克隆到 MiniMax 服务端**（`/v1/files/upload` + `/v1/voice_clone` 生成永久 voice_id），
-   speech 系列模型直接复用且语速/情感为结构化真实参数。
-6. **Studio**：Scenes 列表（增 / 复制 / 删除 / 拖拽排序）+ 中央预览 + 右侧 Prompt・Image・Voice・Video 四个 Tab
-   （场景内完成全部生成）+ 底部 Scene Strip；项目自动保存到 `data/projects/`。
-7. **AI Assistant**：右下角 ✦ 悬浮助手，可理解当前页面/场景上下文，直接执行“把提示词改得更适合H3”“镜头不要移动”等修改。
+1. **设置 → API Keys**：添加厂商 Key（同 v1，AES 加密存储，模型自动发现）。
+2. **Studio**：投放剧本/素材（粘贴文本或拖入 md/txt/图/音）→ 启动流水线 →
+   看板实时显示阶段进度（SSE）→ review 面板确认分镜与素材分配（歧义素材逐项指派）→
+   确认后逐镜生成（关键帧→配音→视频，失败自动重试）→ 导出成片。
+3. **Agent 控制台**（Studio 左栏）：粘贴剧本自动进流水线；"继续生成"推进；也可对话改单镜 Prompt/时长/素材。
+4. **独立工具页**（Prompt/图片/语音/视频）：保持 v1 用法不变。
 
-## 关键设计对照
+## API 摘要（v2）
 
-- Key 单点管理：只在「设置 → API Keys」录入/保存（AES-256-GCM 加密），生成面板不再重复选择凭据；请求自动使用对应厂商的默认 Key，多 Key 用「设为默认」切换，仅配单一厂商 Key 时全链路通用
-- 模型不预制陈旧清单：LLM/生图从凭据的 `/models` 接口自动发现，音色从 MiniMax `get_voice` 发现（系统音色 + 克隆音色）；「设置 → Models」可添加任意自定义模型 ID / 音色 ID（私有部署、新模型均可），选择器记住上次选择
-- 内置兜底仅厂商旗舰：LLM MiniMax-M2、TTS speech-2.5 系列、生图 gpt-image-1、视频 MiniMax H3 + Generic（v1.0 设计范围）
-- 分辨率不写死：默认 **Auto（跟随模型默认，请求不携带分辨率参数）**，720p/1080p 仅为快捷项，Advanced 可输入任意值（如 768p / 2560x1440）原样传给厂商，不支持时厂商错误会显示在生成状态中
-- 无数据库：配置 = 加密 JSON，任务 = `jobs/{job_id}.json`，素材 = `outputs/`，项目 = `projects/{project_id}.json`
-- 不需要 Celery/Redis：FastAPI 内 JobManager + asyncio 任务，前端 3 秒轮询 `GET /api/jobs/{id}`
-- 统一视频接口：`POST /api/video/generate`（provider / model / mode / prompt / duration / aspect_ratio / images），时长 1–15 秒任选
-- 复杂参数默认隐藏：Advanced Settings 收起，首屏只有 Prompt・Reference・Duration・Aspect・Generate
-- H3 作为标准而不是限制：内部统一 H3 结构化 Prompt，选 Generic 时输出通用视频语义
+- `POST/GET /api/projects`、`PATCH /api/projects/{id}`（base_version 乐观锁，409=并发写）
+- `PATCH /api/projects/{id}/scenes/{scene_id}`、`POST .../scenes`、`DELETE`、`POST .../scenes/reorder`（字段级命令，无全量 PUT）
+- `POST /api/projects/{id}/materials`、`POST/DELETE .../bindings`、`POST .../bindings/confirm`
+- `POST /api/projects/{id}/pipeline/start|advance`、`GET .../runs`、`GET .../runs/{run_id}/trace`
+- `POST /api/projects/{id}/scenes/{scene_id}/generate`（keyframe/voice/video，手动与 agent 同路径）
+- `GET /api/projects/{id}/events`（SSE 项目快照流，按 version 去重）
+- `POST /api/agent/run|run/stream|chat|cancel`
+
+## 自检（不联网、不烧额度，FakeLLM 驱动）
+
+```bash
+cd backend
+.venv/Scripts/python.exe tests/store_selfcheck.py      # 状态层：乐观锁/不变量/归档（14 项）
+.venv/Scripts/python.exe tests/reconcile_selfcheck.py  # 调谐器：顺序/幂等/重试/取消（21 项）
+.venv/Scripts/python.exe tests/pipeline_v2_selfcheck.py # 流水线：信封故障注入矩阵+端到端（24 项）
+.venv/Scripts/python.exe tests/agent_v2_selfcheck.py   # Agent：路由/熔断/取消/single-flight（14 项）
+```
 
 ## 配置
 
-- 前端 API 地址：环境变量 `NEXT_PUBLIC_API_BASE`（默认 `http://127.0.0.1:8000`）
-- 数据目录：环境变量 `DATA_DIR`（默认项目根 `data/`）
-- 新增视频厂商：在 `backend/app/providers/video/` 添加适配器并在 `registry.get_video` 注册，模型目录在 `backend/app/config/settings.py`
+- 前端 API 地址：`NEXT_PUBLIC_API_BASE`（默认 `http://127.0.0.1:8000`）；数据目录：`DATA_DIR`（默认 `data/`）
+- 新增视频厂商：`backend/app/providers/video/` 添加适配器并在 registry 注册；工作流入参契约见 `config/settings.py` 的 `AUTODL_WORKFLOW_SPECS`
 
-## 说明
+## 迁移说明（v1 → v2）
 
-- MiniMax/OpenAI 等接口路径按公开文档实现（`/v1/video_generation`、`/v1/query/video_generation`、`/v1/t2a_v2`、
-  `/v1/chat/completions`、`/v1/images/generations|edits`）；如厂商版本调整，只需改对应 Adapter 内的常量。
-- 视频时长支持 1–15 秒任选（滑杆），后端同步校验范围。
+- v1 项目（`data/projects/` 旧 JSON）已整体归档至 `data/projects_archive/`，只读保留、不迁移
+- v1 的全量 PUT 保存、前端轮询回写、双路径生成规则已随重构删除
+- 历史回归场景（素材铁律、音频标签编号、截断防护等）已移植进 v2 自检矩阵

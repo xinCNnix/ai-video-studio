@@ -3,7 +3,7 @@
 复现事故：视频提交后在云端正常生成，本地服务一重启，任务被标成 failed——
 钱花了、片生成好了，却永远取不回来。视频 provider 的 poll 只依赖
 provider_task_id（已随任务文件持久化），重启后完全可以续上：
-轮询 → 下载到 outputs → 按提交时的 Prompt 指纹写回分镜。
+轮询 → 下载到 outputs → 按提交时的 Prompt 指纹经 project_store 写回分镜。
 图片/TTS 任务没有可轮询的云端任务号，维持「重启即失败请重试」。
 """
 import asyncio
@@ -12,8 +12,7 @@ from ..config import settings
 from ..jobs import job_manager
 from ..jobs.manager import ACTIVE_STATUSES
 from ..providers import registry
-from ..services import file_service, self_check, video_service
-from ..services.agent_service import writeback_video_to_scene
+from ..services import file_service, generation_service, self_check, video_service
 
 
 async def _recover_video_job(job: dict) -> None:
@@ -59,23 +58,18 @@ async def _recover_video_job(job: dict) -> None:
     except Exception as exc:  # noqa: BLE001
         job_manager.update(jid, status="failed", error=f"重启恢复下载失败：{str(exc)[:200]}")
         return
-    # 写回分镜：与 Agent 提交路径同一份指纹校验逻辑
-    if params.get("project_id") and params.get("scene_index") is not None:
-        note = writeback_video_to_scene(
-            params["project_id"], output, int(params["scene_index"]),
-            int(params.get("duration") or 5), str(params.get("prompt_fingerprint") or ""),
+    # 写回分镜（v2）：与提交路径同一份指纹校验逻辑
+    if params.get("project_id") and params.get("scene_id"):
+        note = generation_service.writeback_completed_video(
+            params["project_id"], params["scene_id"], output,
+            str(params.get("prompt_fingerprint") or ""),
         )
         if note:
             job_manager.update(jid, writeback_note=note)
 
 
 async def recover_interrupted_jobs() -> int:
-    """启动钩子：为重启前仍在生成中的视频任务重新挂上轮询协程。返回恢复数量。
-
-    两类都救：本次重启前 active 的；以及被旧版重启逻辑误标「服务重启，任务中断」
-    但云端任务号还在的——云端可能仍在生成或结果仍可查询，试一把没坏处
-    （云端任务已过期时 poll 会失败，任务回到 failed，无副作用）。
-    """
+    """启动钩子：为重启前仍在生成中的视频任务重新挂上轮询协程。返回恢复数量。"""
     targets = []
     for j in job_manager.list(limit=100000):
         if j.get("type") != "video" or not j.get("provider_task_id"):

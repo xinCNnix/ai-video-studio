@@ -213,6 +213,36 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
 # ---------------- 写回辅助 ----------------
 
 
+def writeback_completed_video(project_id: str, scene_id: str, output: str, fingerprint: str = "") -> str | None:
+    """把已完成的视频产物写回 v2 分镜（重启恢复路径复用；指纹校验）。
+
+    返回 None = 成功；字符串 = 未写回原因。
+    """
+    try:
+        project = project_store.get(project_id)
+        if not project:
+            return f"项目 {project_id} 不存在，无法写回"
+        scene = next((s for s in project.scenes if s.id == scene_id), None)
+        if not scene:
+            return f"分镜 {scene_id} 已不存在，无法写回"
+        current_fp = prompt_fingerprint(scene.get("prompt") or "")
+        if fingerprint and current_fp != fingerprint:
+            return f"分镜 {scene_id} 的 Prompt 在生成期间已被改写（提交指纹 {fingerprint}，当前 {current_fp}），产物未写回"
+
+        def fn(p: Project) -> None:
+            s = _find_scene(p, scene_id)
+            if not s:
+                return
+            s.assets.video = output
+            s.status = "done"
+            s.error = None
+
+        project_store.mutate(project_id, fn)
+        return None
+    except Exception as exc:  # noqa: BLE001
+        return f"写回分镜 {scene_id} 失败：{str(exc)[:150]}"
+
+
 def _find_scene(p: Project, scene_id: str) -> Scene | None:
     return next((s for s in p.scenes if s.id == scene_id), None)
 

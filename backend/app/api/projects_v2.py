@@ -1,8 +1,8 @@
-"""项目 v2 命令式 API（前缀 /api/p2，Phase 5 前端切换后取代旧 /api/projects）。
+"""项目命令式 API（/api/projects，v2 唯一实现）。
 
 设计要点：
 - 一切修改走 project_store.mutate + base_version 乐观锁（409 = 有并发写，刷新重放）
-- 字段级 PATCH，废除全量 scenes PUT
+- 字段级 PATCH，废除全量 scenes PUT（v1 已随重构移除）
 - GET /{id}/events：SSE 推送项目快照（按 version 去重），替代前端轮询
 """
 import asyncio
@@ -18,7 +18,7 @@ from ..harness.errors import InvariantViolation, ProjectNotFoundError, VersionCo
 from ..harness.state import ImageBinding, Scene, clamp_duration, new_scene_id
 from ..services import project_store
 
-router = APIRouter(prefix="/api/p2/projects", tags=["projects-v2"])
+router = APIRouter(prefix="/api/projects", tags=["projects"])
 
 
 def _http(exc: Exception) -> HTTPException:
@@ -254,6 +254,47 @@ async def unbind_material(project_id: str, req: BindRequest):
         raise
     except (ProjectNotFoundError, VersionConflictError, InvariantViolation) as exc:
         raise _http(exc) from exc
+
+
+# ---------------- 素材登记（不触发流水线） ----------------
+
+
+class AddMaterialsRequest(BaseModel):
+    materials: list[dict]  # [{url, kind?, filename?, text?}]
+
+
+@router.post("/{project_id}/materials")
+async def add_materials(project_id: str, req: AddMaterialsRequest):
+    """登记素材入池（幂等：同 URL 去重）。音频时长探测由服务端补齐。"""
+    from ..harness.state import Material, new_material_id
+    from ..services.pipeline.stages import _infer_kind
+
+    def fn(p) -> None:
+        existing = {m.url for m in p.materials if m.url}
+        for item in req.materials[:50]:
+            url = str(item.get("url") or "")
+            if not url or url in existing:
+                continue
+            p.materials.append(Material(
+                id=new_material_id(),
+                kind=str(item.get("kind") or _infer_kind(url)),
+                url=url,
+                filename=str(item.get("filename") or url.rsplit("/", 1)[-1])[:200],
+                text=(item.get("text") or None),
+            ))
+            existing.add(url)
+
+    try:
+        snap = project_store.mutate(project_id, fn)
+    except (ProjectNotFoundError, InvariantViolation) as exc:
+        raise _http(exc) from exc
+    # 异步补齐音频时长
+    import asyncio
+
+    from ..services.pipeline import stages as pipeline_stages
+
+    asyncio.create_task(pipeline_stages.probe_audio_durations(project_id))
+    return {"ok": True, "materials": snap.get("materials")}
 
 
 # ---------------- 手动生成（与 agent/pipeline 共用 generation_service） ----------------

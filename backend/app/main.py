@@ -1,17 +1,15 @@
-"""FastAPI 入口：AI Video Studio Backend。"""
+"""FastAPI 入口：AI Video Studio Backend（v2：harness + pipeline + agent_v2）。"""
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import settings
-from .api import agent as agent_api
-from .api import agent_v2 as agent_v2_api
+from .api import agent_v2 as agent_api
 from .api import files as files_api
 from .api import image as image_api
 from .api import jobs as jobs_api
-from .api import projects as projects_api
-from .api import projects_v2 as projects_v2_api
+from .api import projects_v2 as projects_api
 from .api import prompt as prompt_api
 from .api import settings as settings_api
 from .api import video as video_api
@@ -59,9 +57,7 @@ for router in (
     video_api.router,
     jobs_api.router,
     projects_api.router,
-    projects_v2_api.router,
     agent_api.router,
-    agent_v2_api.router,
     files_api.router,
 ):
     app.include_router(router)

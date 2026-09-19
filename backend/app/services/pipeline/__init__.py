@@ -9,7 +9,13 @@
 import asyncio
 
 from ...harness import checkpoint, trace as trace_mod
-from ...harness.errors import FatalError, NeedsUserInputError, ProjectNotFoundError, RunBusyError
+from ...harness.errors import (
+    FatalError,
+    NeedsUserInputError,
+    ProjectNotFoundError,
+    RetryableError,
+    RunBusyError,
+)
 from ...harness.watchdog import watchdog
 from .. import export_service, project_store, reconcile
 from . import stages
@@ -104,9 +110,17 @@ async def _execute(project_id: str, run_id: str, trace, payload: dict | None,
                 summary["awaiting"] = _awaiting_for(stage)
                 trace.log("stage_paused", stage=stage, question=exc.question)
                 break
-            except FatalError as exc:
-                checkpoint_stage_failed(project_id, stage, str(exc), trace)
+            except (FatalError, RetryableError) as exc:
+                # LLM/依赖连续失败（Retryable）与不可修复错误（Fatal）同样干净中止：
+                # 完成产物保留、阶段标记 failed、trace 可回放——绝不允许 pipeline 卡死在 running
+                checkpoint_stage_failed(project_id, stage, str(exc)[:500], trace)
                 summary["stages"].append({"stage": stage, "failed": str(exc)[:300]})
+                summary["failed"] = str(exc)[:300]
+                trace.end("failed", at_stage=stage)
+                return summary
+            except Exception as exc:  # noqa: BLE001 - 顶层兜底：未知异常也必须落到 stage_failed
+                checkpoint_stage_failed(project_id, stage, f"未预期异常：{exc}"[:500], trace)
+                summary["stages"].append({"stage": stage, "failed": f"未预期异常：{exc}"[:300]})
                 summary["failed"] = str(exc)[:300]
                 trace.end("failed", at_stage=stage)
                 return summary
@@ -215,8 +229,12 @@ def start_pipeline(project_id: str, payload: dict | None = None,
         p.pipeline.run_id = run_id
 
     project_store.mutate(project_id, fn)
+    # 运行锁在同步段获取：冲突时立即向调用方报错，不产生静默空跑的后台任务
+    if not watchdog.try_acquire(project_id, run_id, "pipeline"):
+        active = watchdog.current(project_id)
+        raise RunBusyError("该项目已有进行中的任务", active_run=active)
     task = asyncio.create_task(_execute(project_id, run_id, trace, payload, credential_id, model))
-    task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+    task.add_done_callback(_log_task_error)
     return {"ok": True, "run_id": run_id}
 
 
@@ -239,8 +257,19 @@ def advance_pipeline(project_id: str, credential_id: str | None = None,
     run_id = trace_mod.new_run_id("pipe")
     trace = trace_mod.RunTrace(run_id, project_id, "pipeline",
                                meta={"note": f"resume from {pipeline.get('stage')}"})
+    if not watchdog.try_acquire(project_id, run_id, "pipeline"):
+        active = watchdog.current(project_id)
+        raise RunBusyError("该项目已有进行中的任务", active_run=active)
     task = asyncio.create_task(
         _execute(project_id, run_id, trace, None, credential_id, model, confirmed=confirmed)
     )
-    task.add_done_callback(lambda t: t.exception() if not t.cancelled() and t.exception() else None)
+    task.add_done_callback(_log_task_error)
     return {"ok": True, "run_id": run_id}
+
+
+def _log_task_error(task: asyncio.Task) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        print(f"[pipeline] 后台任务异常逃逸：{str(exc)[:200]}")

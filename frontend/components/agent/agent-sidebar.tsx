@@ -4,10 +4,10 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { usePathname } from "next/navigation";
 import { Loader2, Paperclip, Send, Sparkles, Square } from "lucide-react";
 import { toast } from "sonner";
-import { api, attachmentKind, fileUrl, pollJob, uploadAttachment, API_BASE, type AgentLlmOption, type UploadedAttachment } from "@/lib/api";
+import { api, attachmentKind, uploadAttachment, type AgentLlmOption, type UploadedAttachment } from "@/lib/api";
 import { hydrateAgentChat, useAgentChatStore, type ChatArchive } from "@/lib/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
-import { useStudioStore } from "@/stores/studio-store";
+import { useStudioV2Store } from "@/stores/studio-v2-store";
 import { Button } from "@/components/ui/button";
 import { SearchableSelect, type SearchableItem } from "@/components/common/searchable-select";
 import { cn } from "@/lib/utils";
@@ -49,16 +49,15 @@ export function AgentSidebar() {
   const archives = useAgentChatStore((s) => s.archives);
   const archiveAndClear = useAgentChatStore((s) => s.archiveAndClear);
   const deleteArchive = useAgentChatStore((s) => s.deleteArchive);
-  const project = useStudioStore((s) => s.project);
-  const currentSceneId = useStudioStore((s) => s.currentSceneId);
-  const updateScene = useStudioStore((s) => s.updateScene);
+  const project = useStudioV2Store((s) => s.project);
+  const currentSceneId = useStudioV2Store((s) => s.currentSceneId);
+  const reloadProject = useStudioV2Store((s) => s.reloadProject);
 
   const [input, setInput] = useState("");
   // busy 同步进全局 store：图片页据此开启历史轮询
   const busy = useAppStore((s) => s.agentBusy);
   const setBusy = useAppStore((s) => s.setAgentBusy);
   const [stopping, setStopping] = useState(false);
-  const [progress, setProgress] = useState<{ done: number; failed: number; total: number } | null>(null);
   // 流式步骤日志：Agent 运行时实时滚动显示，不再只转圈
   const [liveSteps, setLiveSteps] = useState<string[]>([]);
   // 模型选单：当前生效模型 + 全部可选项；picked 为侧栏显式覆盖（localStorage 持久化）
@@ -149,48 +148,9 @@ export function AgentSidebar() {
     el.style.height = `${el.scrollHeight}px`;
   }, [input]);
 
-  const applyJobToScene = async (jobId: string, type: string, sceneIndex?: number, projectId?: string | null) => {
-    try {
-      const job = await pollJob(jobId, () => undefined);
-      if (job.status !== "completed" || !job.output) {
-        toast.error(`Agent 任务 ${jobId} 失败：${job.error || "未知错误"}`);
-        return;
-      }
-      // 分镜编排任务：按场景序号写回，且必须校验项目归属——任务属于哪个项目就写哪个项目，
-      // 用户中途切换项目时绝不写入「当前打开的」项目（防止 A 项目的视频串进 B 项目的分镜）。
-      // 后端写回另有 Prompt 指纹校验兜底，这里是前端第一道防线。
-      if (typeof sceneIndex === "number") {
-        const liveProject = useStudioStore.getState().project;
-        if (projectId && liveProject && liveProject.id !== projectId) {
-          toast.success(`分镜${type === "video" ? "视频" : type === "image" ? "图片" : "语音"}已完成（属于原项目，已由后台写回，不影响当前项目）`);
-          return;
-        }
-        const target = liveProject?.scenes[sceneIndex];
-        if (target) {
-          if (type === "video") updateScene(target.id, { video: job.output, duration: (job.params?.duration as number) || target.duration });
-          else if (type === "image") updateScene(target.id, { image: job.output });
-          else if (type === "tts") updateScene(target.id, { voice: job.output });
-          toast.success(`分镜 ${sceneIndex + 1} 的${type === "video" ? "视频" : type === "image" ? "图片" : "语音"}已生成并写入`);
-          return;
-        }
-      }
-      if (isStudio && scene) {
-        if (type === "video") updateScene(scene.id, { video: job.output });
-        else if (type === "image") updateScene(scene.id, { image: job.output });
-        else if (type === "tts") updateScene(scene.id, { voice: job.output });
-        toast.success(`Agent 生成的${type === "video" ? "视频" : type === "image" ? "图片" : "语音"}已写入当前 Scene`);
-      } else {
-        toast.success(`Agent 任务完成：${job.output}`);
-      }
-    } catch (err) {
-      toast.error((err as Error).message);
-    }
-  };
-
   const runTask = async (goal: string, history: { role: string; content: string }[] = [], display?: string) => {
     addMessage({ role: "user", content: display ?? goal });
     setBusy(true);
-    setProgress(null);
     setLiveSteps([]);
     try {
       // 流式执行：每个工具步骤实时上屏，不再等整个长请求结束才看到进展
@@ -203,7 +163,7 @@ export function AgentSidebar() {
           scene_description: scene?.description ?? "",
           scene_prompt: scene?.prompt ?? "",
           scene_narration: scene?.narration ?? "",
-          scene_image: scene?.image ?? null,
+          scene_image: scene?.assets.keyframe ?? null,
           aspect_ratio: project?.aspect_ratio ?? "16:9",
           project_id: project?.id ?? null,
           // 侧栏显式选择的模型：随请求传给后端，覆盖设置里的默认文本模型
@@ -215,62 +175,16 @@ export function AgentSidebar() {
           }
         }
       );
-      // 先应用文本更新
-      if (res.updates?.prompt && scene) updateScene(scene.id, { prompt: res.updates.prompt });
-      if (res.updates?.description && scene) updateScene(scene.id, { description: res.updates.description });
-      if (res.updates?.narration && scene) updateScene(scene.id, { narration: res.updates.narration });
-      // 分镜被改写：从后端重新加载项目
+      // 分镜被改写：从后端重新加载项目（结果也会经 SSE 推送）
       if (res.project_changed) {
-        await useStudioStore.getState().reloadProject();
-        await useStudioStore.getState().loadProjects();
+        await reloadProject();
       }
-      // 步骤日志
-      // 只展示工具步骤；finish/reply 步骤的文本与 res.reply 相同，拼上会重复
-      const stepsText = res.steps
+      const stepsText = (res.steps ?? [])
         .filter((s) => s.type === "tool")
         .map((s) => `▸ ${s.tool}：${ok(s.result)}`)
         .join("\n");
-      let content = cleanLLMText(`${res.reply}\n\n${stepsText}`);
-      if (res.exports?.length) {
-        content += `\n\n🎬 成片已导出：${fileUrl(res.exports[res.exports.length - 1])}?dl=1`;
-        toast.success("成片导出完成");
-      }
+      const content = cleanLLMText(`${res.reply}\n\n${stepsText}`);
       addMessage({ role: "assistant", content });
-      // 轮询生成的任务并写回场景（带 scene_index 的按序号回写），同时统计完成进度
-      const ttsJobs = res.jobs.filter((j) => j.type === "tts");
-      if (ttsJobs.length > 0) {
-        setProgress({ done: 0, failed: 0, total: ttsJobs.length });
-        ttsJobs.forEach((j) =>
-          pollJob(j.job_id, () => undefined)
-            .then((job) =>
-              setProgress((p) =>
-                p ? { ...p, done: p.done + (job.status === "completed" ? 1 : 0), failed: p.failed + (job.status === "failed" ? 1 : 0) } : p
-              )
-            )
-            .catch(() => setProgress((p) => (p ? { ...p, failed: p.failed + 1 } : p)))
-        );
-        Promise.allSettled(ttsJobs.map((j) => pollJob(j.job_id, () => undefined))).then(async () => {
-          const finals = await Promise.all(ttsJobs.map((j) => api.getJob(j.job_id).catch(() => null)));
-          const okJobs = finals.filter((j) => j?.status === "completed");
-          const failJobs = finals.filter((j) => j?.status === "failed");
-          const reused = res.voice_reused ?? [];
-          const allIds = [...reused, ...okJobs.map((j) => j!.id)].join(",");
-          const zipUrl = allIds ? `${API_BASE}/api/jobs/batch-download/zip?ids=${allIds}` : "";
-          let content = `🔊 配音结束：成功 ${okJobs.length}/${ttsJobs.length}`;
-          if (reused.length) content += `（另有 ${reused.length} 条之前已配过，自动沿用，未重复生成）`;
-          if (failJobs.length) {
-            content += `
-❌ 失败 ${failJobs.length} 条（对我说「把失败的句子重新配音」即可重试）：
-${failJobs
-              .map((j) => `- ${String(j?.params?.text ?? j?.id).slice(0, 30)}`)
-              .join("\n")}`;
-          }
-          if (zipUrl) content += `
-📦 本批打包下载（${okJobs.length} 条）：${zipUrl}`;
-          addMessage({ role: "assistant", content });
-        });
-      }
-      res.jobs.forEach((j) => void applyJobToScene(j.job_id, j.type, j.scene_index, j.project_id));
     } catch (err) {
       addMessage({ role: "assistant", content: `出错了：${(err as Error).message}` });
     } finally {

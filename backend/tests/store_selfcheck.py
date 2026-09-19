@@ -1,13 +1,12 @@
 """store_selfcheck：harness 状态层自检（隔离 DATA_DIR，不碰真实 data/）。
 
 覆盖：v2 建项目 / mutate 版本递增 / 乐观锁 409 / 不变量拒绝非法状态 /
-v1 文件自动归档 / v1 服务对 v2 不可见 / 事件总线投递。
+v1 文件自动归档 / 事件总线投递。
 运行：.venv/Scripts/python.exe tests/store_selfcheck.py
 """
 import os
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -17,7 +16,7 @@ os.environ["DATA_DIR"] = _tmp
 from app.harness.bus import bus  # noqa: E402
 from app.harness.errors import InvariantViolation, VersionConflictError  # noqa: E402
 from app.harness.state import ImageBinding, Material, Scene, check_invariants  # noqa: E402
-from app.services import project_store, project_service  # noqa: E402
+from app.services import project_store  # noqa: E402
 
 PASS = 0
 
@@ -91,15 +90,12 @@ def good_bind(m):
 snap = project_store.mutate(pid, good_bind)
 check("合法绑定通过", snap["scenes"][0]["binding"]["audios"] == ["mat_0", "mat_2"])
 
-# 8. v1 遗留文件自动归档 + v1 服务不可见
+# 8. v1 遗留文件自动归档
 v1_file = Path(_tmp) / "projects" / "project_v1legacy.json"
 v1_file.write_text('{"id": "project_v1legacy", "name": "旧项目", "scenes": []}', encoding="utf-8")
 check("v1 store get 返回 None 并归档", project_store.get("project_v1legacy") is None)
 check("归档文件存在", (Path(_tmp) / "projects_archive" / "project_v1legacy.json").exists())
-check("v1 service list 不含 v2", all(x["id"] != pid for x in project_service.list_projects()))
-check("v1 service get v2 为 None", project_service.get_project(pid) is None)
-check("v1 service save v2 被拒", project_service.save_project(pid, {"scenes": []}) is None)
-check("v2 文件未被 v1 覆盖", project_store.get(pid)["version"] >= 5)
+check("归档后 v2 不受影响", project_store.get(pid) is not None)
 
 # 9. 事件总线：订阅后收到投递
 received: list[dict] = []

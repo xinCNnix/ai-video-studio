@@ -61,8 +61,12 @@ _CANCEL_FLAGS: dict[str, bool] = {}
 
 
 def cancel_run(run_id: str) -> None:
+    """取消指定 run；run_id 为空时取消全部（本地单用户语义，与旧版全局取消兼容）。"""
     if run_id:
         _CANCEL_FLAGS[run_id] = True
+    else:
+        for k in list(_CANCEL_FLAGS):
+            _CANCEL_FLAGS[k] = True
 
 
 def _cancelled(run_id: str) -> bool:
