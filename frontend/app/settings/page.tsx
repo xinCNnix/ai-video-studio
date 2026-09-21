@@ -62,16 +62,32 @@ export default function SettingsPage() {
   const [modelTests, setModelTests] = useState<Record<string, { state: "testing" | "ok" | "fail"; message: string }>>({});
   const [defLlm, setDefLlm] = useState<{ model: string; credential_id: string }>({ model: "", credential_id: "" });
   const [defSaving, setDefSaving] = useState(false);
+  const [discByCred, setDiscByCred] = useState<Record<string, string[]>>({});
 
-  // 默认文本模型选项 = 内置 + 自定义 + 自动发现的全部 LLM
-  const llmOptions = [
-    ...(catalog?.llm ?? []),
-    ...Object.entries(discovered).flatMap(([provider, ids]) =>
-      ids.map((id) => ({ id, label: id, provider }))
-    ),
-  ]
+  // 模型选项按所选凭据过滤：不同 Key 的端点模型不通用（mimo 凭据选 MiniMax 模型必 400），
+  // 该凭据的发现列表优先；未选凭据或无发现数据时退回全局列表。搜索词可回车直接作为模型 ID（allowCustom）
+  const defCred = credentials.find((c) => c.id === defLlm.credential_id);
+  const credModelIds = defCred ? discByCred[defCred.id] ?? [] : [];
+  const llmOptions = (
+    credModelIds.length
+      ? credModelIds.map((id) => ({ id, label: id, provider: defCred!.provider }))
+      : [
+          ...(catalog?.llm ?? []).filter((m) => !defCred || m.provider === defCred.provider),
+          ...Object.entries(discovered).flatMap(([provider, ids]) =>
+            !defCred || provider === defCred.provider ? ids.map((id) => ({ id, label: id, provider })) : []
+          ),
+        ]
+  )
     .filter((m, i, arr) => arr.findIndex((x) => x.id === m.id && x.provider === m.provider) === i)
     .map((m) => ({ value: m.id, label: `${m.label}（${catalog?.providers.find((p) => p.id === m.provider)?.label ?? m.provider}）` }));
+
+  const changeDefCredential = (credId: string) => {
+    setDefLlm((f) => {
+      const ids = discByCred[credId] ?? [];
+      const keep = f.model && ids.includes(f.model);
+      return { credential_id: credId, model: keep ? f.model : ids[0] ?? "" };
+    });
+  };
 
   const saveDefaultLlm = async () => {
     setDefSaving(true);
@@ -108,6 +124,10 @@ export default function SettingsPage() {
     void loadCatalog();
     void loadCredentials();
     void loadDiscovered();
+    api
+      .getDiscoveredModels()
+      .then(({ discovered_by_credential }) => setDiscByCred(discovered_by_credential ?? {}))
+      .catch(() => undefined);
     refreshCustom();
     refreshTemplates();
     api.getSkills().then(({ skills }) => setSkills(skills)).catch(() => undefined);
@@ -115,7 +135,7 @@ export default function SettingsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // 凭据加载后：若从未设置默认模型，预填全局默认凭据 + 其端点上的第一个模型
+  // 凭据加载后：若从未设置默认模型，预填默认凭据 + 该凭据端点上发现的第一个模型
   useEffect(() => {
     if (!credentials.length || defLlm.credential_id) return;
     api
@@ -125,12 +145,12 @@ export default function SettingsPage() {
           setDefLlm({ model: default_llm.model, credential_id: default_llm.credential_id ?? "" });
           return;
         }
-        const cred = credentials[0];
+        const cred = credentials.find((c) => c.is_default) ?? credentials[0];
         setDefLlm((f) => (f.credential_id ? f : { ...f, credential_id: cred.id }));
         api
           .getDiscoveredModels()
-          .then(({ discovered }) => {
-            const ids = discovered[cred.provider] ?? [];
+          .then(({ discovered_by_credential }) => {
+            const ids = discovered_by_credential?.[cred.id] ?? [];
             if (ids.length) setDefLlm((f) => (f.model ? f : { ...f, model: ids[0] }));
           })
           .catch(() => undefined);
@@ -568,8 +588,9 @@ export default function SettingsPage() {
           <div className="rounded-xl border border-primary/30 bg-card p-5">
             <div className="mb-1 text-sm font-semibold">默认文本模型（Agent / Prompt 链路使用）</div>
             <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
-              AI Assistant（聊天/执行）、Prompt 生成等未显式指定模型的链路都会使用这里的选择。
-              模型必须与所选凭据匹配（例如小米 MiMo 凭据选 mimo-v2.5-pro）。
+              Agent / 流水线（剧本解析、分镜规划、素材绑定）、AI 助手等所有文本链路都使用这里的选择。
+              选凭据后列表只显示该凭据端点上的模型；列表没有的模型可直接搜索后回车手动指定（例如 mimo-v2.5-pro）。
+              改完记得点「保存」，保存后对新任务即刻生效。
             </p>
             <div className="flex flex-wrap items-center gap-2">
               <SearchableSelect
@@ -578,7 +599,9 @@ export default function SettingsPage() {
                 value={defLlm.model}
                 onChange={(v) => setDefLlm((f) => ({ ...f, model: v }))}
                 placeholder="选择文本模型"
-                searchPlaceholder="搜索模型…"
+                searchPlaceholder="搜索模型（可手动输入 ID 回车）…"
+                allowCustom
+                customLabelPrefix="手动指定模型 ID"
               />
               <SearchableSelect
                 className="w-60"
@@ -586,7 +609,7 @@ export default function SettingsPage() {
                   .filter((c) => providersForCapability("llm").some((p) => p.id === c.provider))
                   .map((c) => ({ value: c.id, label: `${catalog?.providers.find((p) => p.id === c.provider)?.label ?? c.provider} · ${c.name}` }))}
                 value={defLlm.credential_id ?? ""}
-                onChange={(v) => setDefLlm((f) => ({ ...f, credential_id: v }))}
+                onChange={changeDefCredential}
                 placeholder="选择凭据"
               />
               <Button size="sm" variant="accent" onClick={() => void saveDefaultLlm()} disabled={!defLlm.model || !defLlm.credential_id}>

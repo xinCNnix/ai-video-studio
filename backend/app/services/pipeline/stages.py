@@ -30,6 +30,11 @@ NORMALIZE_CHUNK_CHARS = 3500
 PLAN_BATCHHint = 8  # 提示模型单批输出规模上限
 PLAN_MAX_BATCHES = 25  # 200 镜安全上限
 PLAN_GUARD_RETRIES = 2  # storyboard 保真闸门：镜数≠拍数时的纠错重规划次数
+PLAN_WINDOW_SHOTS = 4  # storyboard 分窗：单窗拍数上限（思考+正文共用 max_tokens，窗大正文必空）
+PLAN_WINDOW_CHARS = 4000  # storyboard 分窗：单窗原文累计字数上限
+# plan 输出预算必须连推理过程一起覆盖：M3 是思考模型，16384 会被思考烧光
+# （finish_reason=length、正文为空，2026-09-21 三连空事故）；窗小 + 预算大双保险
+LLM_MAX_OUTPUT_TOKENS = 32768
 BIND_CONFIDENCE_THRESHOLD = 0.7
 
 NORMALIZE_SYSTEM = """你是剧本结构化引擎。把剧本解析为标准 JSON 结构（只输出 JSON，不要任何解释文字）。
@@ -521,8 +526,36 @@ def recover_storyboard_source(beats: list[dict], source: str) -> tuple[list[dict
     return beats, preamble
 
 
+_H1_SECTION_LINE_RE = re.compile(r"^#[ \t]*[^#\r\n]", re.M)
+
+
+def trim_trailing_sections(beats: list[dict]) -> list[dict]:
+    """末拍切回稿尾全局章节之前：没有后续片段头时，末拍切片会一路吃到文件尾，
+    把"六、节奏结构 / 七、视觉风格关键词"这类全稿设定吞成最后一镜的原文
+    （它们是全局设定，不是该镜的拍摄内容）。在末拍正文里（跳过首行编号头）
+    找第一个 h1 段落标题，把切片收回到它之前；切完剩余过短视为误匹配，不切。
+    """
+    if not beats:
+        return beats
+    last = beats[-1]
+    st = (last.get("source_text") or "").strip()
+    if "\n" not in st:
+        return beats
+    m = _H1_SECTION_LINE_RE.search(st, st.find("\n") + 1)
+    if not m:
+        return beats
+    keep = re.sub(r"(?:\s*-{3,})+\s*$", "", st[: m.start()]).rstrip()
+    if len(keep) < 80:
+        return beats
+    last["source_text"] = keep
+    return beats
+
+
+# 认「片段 N｜标题」「分镜 N｜标题」及裸编号行「分镜 N」（行尾锚定，散文里"分镜 2 的…"
+# 不在行首裸编号位不会误触）；【第N镜】括号式。裸"片段N：7s"这类时长行由标题闸排除。
 _FRAGMENT_HEADER_LINE_RE = re.compile(
-    r"^(?:#{1,4}\s*)?(?:H3\s*)?片段\s*\d+\s*[｜|:：]\s*[^\n]+"
+    r"^(?:#{1,4}\s*)?(?:H3\s*)?(?:片段|分镜)\s*\d+\s*[｜|:：]\s*[^\n]+"
+    r"|^(?:#{1,4}\s*)?(?:H3\s*)?(?:片段|分镜)\s*\d+\s*$"
     r"|^(?:#{1,4}\s*)?【第[一二三四五六七八九十百零\d]+\s*镜】[^\n]*",
     re.M,
 )
@@ -538,7 +571,13 @@ def detect_fragment_headers(source: str) -> list[tuple[int, str]]:
     headers: list[tuple[int, str]] = []
     for m in _FRAGMENT_HEADER_LINE_RE.finditer(source or ""):
         line = m.group(0).strip()
-        title = re.sub(r"^(?:#{1,4}\s*)?(?:H3\s*)?片段\s*\d+\s*[｜|:：]\s*|^(?:#{1,4}\s*)?【第[一二三四五六七八九十百零\d]+\s*镜】\s*", "", line).strip()
+        title = re.sub(
+            r"^(?:#{1,4}\s*)?(?:H3\s*)?(?:片段|分镜)\s*\d+\s*(?:[｜|:：]\s*)?"
+            r"|^(?:#{1,4}\s*)?【第[一二三四五六七八九十百零\d]+\s*镜】\s*",
+            "", line).strip()
+        if not title:
+            # 裸编号头（"# 分镜 1"）：编号行本身当标题——"分镜/片段"两个汉字可过下方汉字闸
+            title = re.sub(r"^#{1,4}\s*", "", line).strip()
         if not _CJK_RUN_RE.search(title) or re.fullmatch(r"[\d\s秒Ss.：:]+", title):
             continue
         headers.append((m.start(), title[:50]))
@@ -595,7 +634,7 @@ async def run_normalize(project_id: str, envelope, trace=None) -> dict:
         meta_user = ("解析以下分镜稿，只需要 script_type / logline / characters / notes 四项元数据"
                      "（beats 给 1 条占位即可，严禁自行逐镜拆分——拆拍由系统按片段标题确定性完成）：\n\n"
                      + source[:NORMALIZE_CHUNK_CHARS * 2])
-        result = await envelope.structured_call(NORMALIZE_SYSTEM, meta_user, Screenplay)
+        result = await envelope.structured_call(NORMALIZE_SYSTEM, meta_user, Screenplay, max_tokens=LLM_MAX_OUTPUT_TOKENS)
         script_type = "storyboard"
         logline = result.logline
         notes.append(result.notes)
@@ -609,7 +648,7 @@ async def run_normalize(project_id: str, envelope, trace=None) -> dict:
         for i, chunk in enumerate(chunks):
             part = f"【剧本片段 {i + 1}/{len(chunks)}】\n{chunk}" if len(chunks) > 1 else chunk
             extra = f"\n\n（整部剧本已分 {len(chunks)} 片段，本片段类型沿用首片段判定：{script_type}）" if script_type and len(chunks) > 1 else ""
-            result = await envelope.structured_call(NORMALIZE_SYSTEM, f"解析以下剧本：\n\n{part}{extra}", Screenplay)
+            result = await envelope.structured_call(NORMALIZE_SYSTEM, f"解析以下剧本：\n\n{part}{extra}", Screenplay, max_tokens=LLM_MAX_OUTPUT_TOKENS)
             script_type = script_type or result.script_type
             logline = logline or result.logline
             notes.append(result.notes)
@@ -638,6 +677,7 @@ async def run_normalize(project_id: str, envelope, trace=None) -> dict:
     }
     if script_type == "storyboard":
         beats, preamble = recover_storyboard_source(beats, source)
+        beats = trim_trailing_sections(beats)
         screenplay["beats"] = beats
         screenplay["global_notes"] = preamble[:20000]
         if trace:
@@ -669,33 +709,69 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
     constraints = _model_constraints(project)
     chars = project.screenplay.get("characters") or []
 
-    type_note = (
-        f"剧本类型：storyboard（用户分镜已成稿，共 {len(beats)} 拍）→ 一拍一镜，必须恰好输出 {len(beats)} 镜，"
-        "逐拍对录，严禁增删拆合与虚构画面；素材清单已标注上传序号，第 N 张上传图=原文 <Image N>"
-        if is_storyboard else
-        f"剧本类型：{script_type or 'unknown'} → 节拍是创作素材，可按叙事需要规划分镜"
+    global_notes = str(project.screenplay.get("global_notes") or "").strip()
+    global_block = f"\n\n全局设定与参考图编号表（原文头部，<Image N> 身份以此为准）：\n{global_notes}\n" if is_storyboard and global_notes else ""
+    manifest = materials_manifest(project, with_order=is_storyboard)
+    chars_block = "\n".join(f"- {c['name']}：{c['design']}" for c in chars) or "（无）"
+    common_mid = (
+        f"\n\n视频模型约束：{constraints}\n\n角色设定（跨镜一致，Prompt 中需体现或用参考图锚定）：\n{chars_block}"
+        f"{global_block}\n素材清单（需引用素材时用 material_id）：\n{manifest}\n\n"
     )
-    if is_storyboard:
-        beats_text = "\n\n".join(
-            f"===== 第 {i + 1} 拍【原文】（逐字，规划此镜时以它为最高依据）=====\n{(b.get('source_text') or b.get('description') or '').strip()}"
+
+    def storyboard_beats_text(items: list[dict], start_no: int) -> str:
+        return "\n\n".join(
+            f"===== 全稿第 {start_no + i} 拍【原文】（逐字，规划此镜时以它为最高依据）=====\n{(b.get('source_text') or b.get('description') or '').strip()}"
             + (f"\n（摘要：{b.get('description') or ''}｜旁白：{b.get('narration') or ''}）" if not b.get("source_text") else "")
-            for i, b in enumerate(beats)
+            for i, b in enumerate(items)
         )
-    else:
+
+    def storyboard_windows() -> list[tuple[list[dict], str]]:
+        """storyboard 分窗：单窗 ≤PLAN_WINDOW_SHOTS 拍且原文累计 ≤PLAN_WINDOW_CHARS 字。
+
+        事故（2026-09-21 吕满春西游 6 镜稿）：全稿原文一锅端进一条消息，MiniMax-M3
+        是推理模型、思考与正文共用 max_tokens，一次规划多个 H3 六段式长 prompt 时
+        预算被思考烧尽、正文为空，连续 3 轮失败。窗小 → 单次任务小，思考与输出
+        都落回预算内；每窗自带一拍一镜数量闸门，全稿总数闸门保持不变。
+        """
+        windows: list[list[dict]] = []
+        cur: list[dict] = []
+        cur_chars = 0
+        for b in beats:
+            size = len(b.get("source_text") or b.get("description") or "") + 100
+            if cur and (len(cur) >= PLAN_WINDOW_SHOTS or cur_chars + size > PLAN_WINDOW_CHARS):
+                windows.append(cur)
+                cur, cur_chars = [], 0
+            cur.append(b)
+            cur_chars += size
+        if cur:
+            windows.append(cur)
+        out: list[tuple[list[dict], str]] = []
+        no = 1
+        for win in windows:
+            note = (
+                f"剧本类型：storyboard（用户分镜已成稿，全稿共 {len(beats)} 镜）→ 本窗为全稿第 {no}–{no + len(win) - 1} 镜，"
+                f"一拍一镜，必须恰好输出 {len(win)} 镜，逐拍对录，严禁增删拆合与虚构画面；"
+                "素材清单已标注上传序号，第 N 张上传图=原文 <Image N>"
+            )
+            base = (
+                f"{note}{common_mid}剧本节拍（本窗 {len(win)} 拍，按播放顺序）：\n{storyboard_beats_text(win, no)}\n\n"
+                f"规划本窗全部分镜，共 {len(win)} 镜，一次性全部输出（done=true）。"
+            )
+            out.append((win, base))
+            no += len(win)
+        return out
+
+    if not is_storyboard:
+        type_note = f"剧本类型：{script_type or 'unknown'} → 节拍是创作素材，可按叙事需要规划分镜"
         beats_text = "\n".join(
             f"{i + 1}. [{b.get('title') or ''}] 画面：{b.get('description') or ''}｜旁白：{b.get('narration') or ''}"
             for i, b in enumerate(beats)
         )
-    global_notes = str(project.screenplay.get("global_notes") or "").strip()
-    global_block = f"\n\n全局设定与参考图编号表（原文头部，<Image N> 身份以此为准）：\n{global_notes}\n" if is_storyboard and global_notes else ""
-    manifest = materials_manifest(project, with_order=is_storyboard)
-    base_user = (
-        f"{type_note}\n\n视频模型约束：{constraints}\n\n角色设定（跨镜一致，Prompt 中需体现或用参考图锚定）：\n"
-        + ("\n".join(f"- {c['name']}：{c['design']}" for c in chars) or "（无）")
-        + f"{global_block}\n素材清单（需引用素材时用 material_id）：\n{manifest}\n\n剧本节拍（按播放顺序，共 {len(beats)} 拍）：\n{beats_text}\n\n"
-        f"规划全部分镜。总数不超过 {PLAN_BATCHHint} 镜时一次性全部输出（done=true）；"
-        f"更多时先输出发音完整的前 {PLAN_BATCHHint} 镜（done=false），后续我会要求继续。"
-    )
+        base_user = (
+            f"{type_note}{common_mid}剧本节拍（按播放顺序，共 {len(beats)} 拍）：\n{beats_text}\n\n"
+            f"规划全部分镜。总数不超过 {PLAN_BATCHHint} 镜时一次性全部输出（done=true）；"
+            f"更多时先输出发音完整的前 {PLAN_BATCHHint} 镜（done=false），后续我会要求继续。"
+        )
 
     from .schemas import PlanBatch, PlanBatchH3
 
@@ -705,16 +781,18 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
     plan_system = plan_system_prompt(h3_style)
     plan_schema = PlanBatchH3 if h3_style else PlanBatch
 
-    async def collect_batches(extra_note: str = "") -> list[dict]:
-        base = base_user + (f"\n\n{extra_note}" if extra_note else "")
+    async def collect_batches(base: str, extra_note: str = "") -> list[dict]:
+        first = base + (f"\n\n{extra_note}" if extra_note else "")
         shots: list[dict] = []
         for batch_no in range(PLAN_MAX_BATCHES):
-            user = base if batch_no == 0 else (
-                f"继续输出分镜。已输出 {len(shots)} 镜：\n"
+            # 续批消息重带完整 base：structured_call 每次都是全新会话，
+            # 只发已出镜清单会让模型在没有原文的情况下凭标题续写（幻觉源）
+            user = first if batch_no == 0 else (
+                base + f"\n\n【继续】本批分镜尚未输出完，已输出 {len(shots)} 镜：\n"
                 + "\n".join(f"- {i + 1}. {s['title']}" for i, s in enumerate(shots))
-                + f"\n\n请从第 {len(shots) + 1} 镜继续，单批最多 {PLAN_BATCHHint} 镜，全部输出完时 done=true。"
+                + f"\n请从第 {len(shots) + 1} 镜继续，一次性输出剩余全部，输出完时 done=true。"
             )
-            batch = await envelope.structured_call(plan_system, user, plan_schema, max_tokens=16384)
+            batch = await envelope.structured_call(plan_system, user, plan_schema, max_tokens=LLM_MAX_OUTPUT_TOKENS)
             shots.extend(s.model_dump() for s in batch.shots)
             if trace:
                 trace.log("plan_batch", batch=batch_no + 1, got=len(batch.shots), total_planned=batch.total, done=batch.done)
@@ -722,7 +800,23 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
                 break
         return shots
 
-    all_shots = await collect_batches()
+    async def plan_storyboard_windows(extra_note: str = "") -> list[dict]:
+        acc: list[dict] = []
+        for w_no, (win, wbase) in enumerate(storyboard_windows()):
+            ws = await collect_batches(wbase, extra_note)
+            if len(ws) != len(win):
+                if trace:
+                    trace.log("plan_window_retry", window=w_no + 1, expected=len(win), got=len(ws))
+                ws = await collect_batches(
+                    wbase,
+                    f"【数量错误】上一轮输出 {len(ws)} 镜，本窗共 {len(win)} 拍，必须一拍一镜恰好 {len(win)} 镜："
+                    "逐拍对录，不得增加、删除、拆分、合并。")
+            if trace:
+                trace.log("plan_window", window=w_no + 1, beats=len(win), got=len(ws), total=len(acc) + len(ws))
+            acc.extend(ws)
+        return acc
+
+    all_shots = await (plan_storyboard_windows() if is_storyboard else collect_batches(base_user))
     if not all_shots:
         raise FatalError("plan 阶段没有产出任何分镜")
 
@@ -734,9 +828,9 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
                 break
             if trace:
                 trace.log("plan_guard_retry", attempt=attempt, expected=len(beats), got=len(all_shots))
-            all_shots = await collect_batches(
-                f"【数量错误】上一轮输出了 {len(all_shots)} 镜，但用户分镜稿共 {len(beats)} 镜（一拍一镜）。"
-                f"必须恰好输出 {len(beats)} 镜：逐拍对录，不得增加、删除、拆分、合并。"
+            all_shots = await plan_storyboard_windows(
+                f"【数量错误】上一轮共输出 {len(all_shots)} 镜，但用户分镜稿共 {len(beats)} 镜（一拍一镜）。"
+                f"必须每窗恰好对录：不得增加、删除、拆分、合并。"
             )
         if len(all_shots) != len(beats):
             raise FatalError(
@@ -1170,6 +1264,7 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
             BIND_SYSTEM,
             f"未分配素材：\n{manifest}\n\n分镜列表：\n{scenes_desc}\n\n把每个素材分配到最合适的分镜（一个素材可多次出现）。",
             BindDecisionList,
+            max_tokens=LLM_MAX_OUTPUT_TOKENS,
         )
         scene_img_tokens: dict[str, set[str]] = {}
         for scene_id2, kind, mid, _role in decisions:

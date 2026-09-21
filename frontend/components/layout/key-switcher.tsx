@@ -21,12 +21,18 @@ export function KeySwitcher() {
   const loadCatalog = useAppStore((s) => s.loadCatalog);
   const [open, setOpen] = useState(false);
   const [switchingId, setSwitchingId] = useState<string | null>(null);
+  const [defaultLlm, setDefaultLlm] = useState<{ model: string; credential_id: string | null } | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     void loadCredentials();
     void loadCatalog();
   }, [loadCredentials, loadCatalog]);
+
+  useEffect(() => {
+    // 当前生效的默认文本模型（流水线/Agent 都按它走）：顶栏常驻可见，配置错了一眼能看出来
+    api.getDefaultLlm().then(({ default_llm }) => setDefaultLlm(default_llm)).catch(() => undefined);
+  }, []);
 
   useEffect(() => {
     if (!open) return;
@@ -74,7 +80,8 @@ export function KeySwitcher() {
       if (bound && bound !== key.id) {
         const boundCred = credentials.find((c) => c.id === bound);
         if (boundCred && boundCred.provider === key.provider) {
-          await api.setDefaultLlm({ model: default_llm!.model, credential_id: key.id });
+          const updated = await api.setDefaultLlm({ model: default_llm!.model, credential_id: key.id });
+          setDefaultLlm(updated.default_llm);
         }
       }
       await loadCredentials();
@@ -157,8 +164,20 @@ export function KeySwitcher() {
               </div>
             ))}
           </div>
-          <div className="border-t border-border px-3 py-1.5 text-[10px] text-muted-foreground">
+          <div className="border-t border-border px-3 py-1.5 text-[10px] leading-relaxed text-muted-foreground">
             影响该厂商的 LLM · 生图 · 视频 · TTS 调用；默认文本模型随同厂商自动改绑
+            {defaultLlm ? (
+              <div className="text-primary/90">
+                当前文本模型：{defaultLlm.model}
+                {credentials.find((c) => c.id === defaultLlm.credential_id)
+                  ? ` · ${credentials.find((c) => c.id === defaultLlm.credential_id)!.name}`
+                  : ""}
+              </div>
+            ) : (
+              <div className="text-amber-400/90">
+                未设置默认文本模型（流水线将自动挑选）→ 设置 → 默认文本模型
+              </div>
+            )}
           </div>
         </div>
       )}

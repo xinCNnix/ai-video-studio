@@ -101,6 +101,7 @@ def _discover_voices(cred: dict) -> tuple[list[dict], str | None]:
 @router.get("/discovered-models")
 async def discovered_models():
     results: dict[str, list[str]] = {}
+    results_by_cred: dict[str, list[str]] = {}  # 凭据id → 该端点实际可用的模型
     discovered_tts: dict[str, list[str]] = {}
     voices: dict[str, list[dict]] = {}
     voice_errors: list[dict] = []
@@ -177,9 +178,12 @@ async def discovered_models():
                 ]
                 llm_ids, tts_ids = classify(ids)
                 current = results.setdefault(cred["provider"], [])
+                cred_models = results_by_cred.setdefault(pub["id"], [])
                 for mid in llm_ids:
                     if mid not in current:
                         current.append(mid)
+                    if mid not in cred_models:
+                        cred_models.append(mid)
                 if tts_ids:
                     # mimo-* TTS 走小米私有协议：归属 xiaomi 厂商，避免与内置条目
                     # 在选择器里重复，并保证语音页选中后按小米协议路由
@@ -205,6 +209,7 @@ async def discovered_models():
         existing.append({"id": a["id"], "label": f"{a['name']}（{tag}）", "source": "asset"})
     return {
         "discovered": results,
+        "discovered_by_credential": results_by_cred,
         "discovered_tts": discovered_tts,
         "voices": voices,
         "voice_errors": voice_errors,
@@ -241,7 +246,7 @@ async def test_model(req: TestModelRequest):
     try:
         llm = get_llm(req.credential_id, provider_hint=req.provider)
         out = await llm.generate(
-            [{"role": "user", "content": "ping"}], req.model, temperature=0, max_tokens=8
+            [{"role": "user", "content": "ping"}], req.model, temperature=0, max_tokens=1024
         )
         return {"ok": True, "message": f"可用（{int((time.time() - start) * 1000)}ms）", "sample": (out or "")[:60]}
     except ProviderError as exc:

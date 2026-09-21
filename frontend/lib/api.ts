@@ -121,6 +121,7 @@ export const api = {
   getDiscoveredModels: () =>
     request<{
       discovered: Record<string, string[]>;
+      discovered_by_credential: Record<string, string[]>;
       discovered_tts: Record<string, string[]>;
       voices: Record<string, { id: string; label: string; source: string }[]>;
       voice_errors: { provider: string; name: string; message: string }[];
