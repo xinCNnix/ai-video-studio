@@ -114,6 +114,7 @@ TTS_MODELS: list[dict] = [
     {"id": "mimo-v2.5-tts", "label": "MiMo TTS 预置音色", "provider": "xiaomi"},
     {"id": "mimo-v2.5-tts-voicedesign", "label": "MiMo TTS 音色设计（描述即音色）", "provider": "xiaomi"},
     {"id": "mimo-v2.5-tts-voiceclone", "label": "MiMo TTS 声音克隆（上传样本即音色）", "provider": "xiaomi"},
+    {"id": "higgs-audio-v3-tts-4b", "label": "Higgs Audio v3 TTS（本地 ONNX · 声音克隆）", "provider": "higgs"},
 ]
 
 # 音色不预制：优先从凭据的 get_voice 接口发现（系统音色 + 克隆音色），

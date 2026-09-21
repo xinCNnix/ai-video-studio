@@ -2,8 +2,10 @@
 
 /** Agent 控制台：对话 + 步骤流展示（SSE）。创作类请求由后端路由直通流水线。 */
 import { useEffect, useRef, useState } from "react";
-import { Bot, Eraser, Loader2, Send, User, Wrench } from "lucide-react";
-import { runAgentV2Stream } from "@/lib/api-v2";
+import { Bot, Eraser, Loader2, Paperclip, Send, User, Wrench } from "lucide-react";
+import { toast } from "sonner";
+import { attachmentKind } from "@/lib/api";
+import { runAgentV2Stream, uploadMaterial } from "@/lib/api-v2";
 import { useStudioV2Store } from "@/stores/studio-v2-store";
 import { MdText } from "@/components/studio-v2/md-text";
 import { cn } from "@/lib/utils";
@@ -13,6 +15,16 @@ interface Msg {
   text: string;
   steps?: { tool?: string; ok?: boolean; note?: string }[];
 }
+
+/** 后端 route() 的模式 → 控制台可读标签（tools_voice 等原始值不给用户看）。 */
+const ROUTE_LABELS: Record<string, string> = {
+  pipeline_start: "拆分镜流水线",
+  classify: "意图分流",
+  pipeline_advance: "继续生成",
+  export: "导出成片",
+  tools: "创作助理",
+  tools_voice: "配音台词师",
+};
 
 /** 超长消息（粘贴的剧本等）折叠显示，避免撑爆控制台。 */
 const LONG_LINES = 8;
@@ -51,26 +63,41 @@ export function AgentConsole() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [running, setRunning] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [dragOver, setDragOver] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, running]);
+
+  // 切换项目即清空对话：messages 会作为 history 随请求发给 agent，
+  // 跨项目残留会把上一个项目的上下文串进新项目的运行
+  const projectId = project?.id;
+  useEffect(() => {
+    setMessages([]);
+  }, [projectId]);
 
   const send = async (text?: string) => {
     const goal = (text ?? input).trim();
     if (!goal || running || !project) return;
     setInput("");
     if (inputRef.current) inputRef.current.style.height = "auto";
+    // 携带最近对话历史（不含本条，追加前先取）：后端工具循环据此维持上下文记忆
+    const history = messages
+      .slice(-12)
+      .filter((m) => m.text.trim())
+      .map((m) => ({ role: m.role, content: m.text.slice(0, 3000) }));
     setMessages((m) => [...m, { role: "user", text: goal }]);
     setRunning(true);
     const steps: Msg["steps"] = [];
     let reply = "";
     try {
-      await runAgentV2Stream({ goal, project_id: project.id }, (e) => {
+      await runAgentV2Stream({ goal, project_id: project.id, history }, (e) => {
         if (e.type === "route") {
-          steps.push({ note: `路由：${e.mode ?? ""}` });
+          steps.push({ note: `路由：${ROUTE_LABELS[e.mode ?? ""] ?? e.mode ?? ""}` });
           setMessages((m) => [...m]);
         }
         if (e.type === "step" && e.tool) {
@@ -92,8 +119,66 @@ export function AgentConsole() {
     }
   };
 
+  /** 拖入 / 粘贴 / 选择文件：剧本（.md/.txt）上传后内联全文直接提交——与粘贴剧本同一行为，
+   * 长文本会被后端路由直通流水线；图/音/视上传后以 URL 随指令提交，由 Agent 工具处理。 */
+  const addFiles = async (files: FileList | File[]) => {
+    if (running || uploading) return;
+    const list = Array.from(files);
+    if (!list.length) return;
+    if (!project) {
+      toast.error("请先创建或打开项目，再投放剧本");
+      return;
+    }
+    for (const f of list) {
+      if (!attachmentKind(f)) {
+        toast.error(`不支持的文件类型：${f.name}（支持 .md/.txt 剧本与图片/音频/视频）`);
+        return;
+      }
+    }
+    setUploading(true);
+    try {
+      const docParts: string[] = [];
+      const mediaParts: string[] = [];
+      for (const f of list) {
+        const m = await uploadMaterial(f);
+        if (m.kind === "doc") {
+          docParts.push(m.text ? `剧本文档 ${m.filename} 全文：\n${m.text}` : `剧本文档 ${m.filename}：${m.url}（用 read_doc 读取全文）`);
+        } else {
+          mediaParts.push(`- ${m.kind === "image" ? "参考图" : m.kind === "audio" ? "配音" : "参考视频"}：${m.url}`);
+        }
+      }
+      const goal = docParts.length
+        ? [...docParts, ...mediaParts].join("\n\n")
+        : `请按以下素材处理：\n\n${mediaParts.join("\n")}`;
+      await send(goal);
+    } catch (err) {
+      toast.error(`上传失败：${(err as Error).message}`);
+    } finally {
+      setUploading(false);
+    }
+  };
+
   return (
-    <div className="flex h-full w-[320px] shrink-0 flex-col border-r border-border bg-card/30">
+    <div
+      className={cn(
+        "relative flex h-full w-[320px] shrink-0 flex-col border-r border-border bg-card/30",
+        dragOver && "bg-primary/5 ring-2 ring-inset ring-primary/50",
+      )}
+      onDragOver={(e) => {
+        if (!e.dataTransfer.types.includes("Files")) return;
+        e.preventDefault();
+        setDragOver(true);
+      }}
+      onDragLeave={(e) => {
+        e.preventDefault();
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setDragOver(false);
+      }}
+      onDrop={(e) => {
+        e.preventDefault();
+        setDragOver(false);
+        if (e.dataTransfer.files.length) void addFiles(e.dataTransfer.files);
+      }}
+    >
       <div className="flex items-center gap-2 border-b border-border px-4 py-3 text-sm font-semibold">
         <Bot className="size-4 text-primary" />
         Agent 控制台
@@ -111,7 +196,7 @@ export function AgentConsole() {
       <div className="flex-1 space-y-3 overflow-y-auto p-3">
         {messages.length === 0 && (
           <div className="rounded-xl bg-secondary/40 p-3 text-[11px] leading-relaxed text-muted-foreground">
-            直接对话即可：粘贴剧本会自动进流水线；说「继续生成」推进流水线；也可以让我改某一镜的 Prompt/时长/素材。
+            直接对话即可：粘贴或拖入 .md/.txt 剧本会自动进流水线；说「继续生成」推进流水线；也可以让我改某一镜的 Prompt/时长/素材。
           </div>
         )}
         {messages.map((m, i) => (
@@ -142,6 +227,22 @@ export function AgentConsole() {
         <div ref={bottomRef} />
       </div>
       <div className="border-t border-border p-2.5">
+        <input
+          ref={fileRef}
+          type="file"
+          multiple
+          hidden
+          accept=".md,.txt,image/*,audio/*,video/*"
+          onChange={(e) => {
+            if (e.target.files?.length) void addFiles(e.target.files);
+            e.currentTarget.value = "";
+          }}
+        />
+        {dragOver && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center bg-primary/10 text-xs font-semibold text-primary">
+            松手投放剧本 / 素材
+          </div>
+        )}
         <div className="mb-2 flex gap-1.5">
           <button
             type="button"
@@ -172,6 +273,13 @@ export function AgentConsole() {
                 el.style.height = "auto";
                 el.style.height = `${Math.min(el.scrollHeight, 112)}px`;
               }}
+              onPaste={(e) => {
+                // 资源管理器里复制的文件（非文本片段）走上传，纯文本粘贴不受影响
+                if (e.clipboardData?.files?.length) {
+                  e.preventDefault();
+                  void addFiles(e.clipboardData.files);
+                }
+              }}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                   e.preventDefault();
@@ -179,10 +287,19 @@ export function AgentConsole() {
                 }
               }}
               rows={1}
-              placeholder="输入指令或粘贴剧本…（Shift+Enter 换行）"
+              placeholder="输入指令或粘贴/拖入剧本…（Shift+Enter 换行）"
               className="max-h-28 min-h-9 w-full resize-none bg-transparent py-2 text-xs outline-none"
             />
           </div>
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={running || uploading}
+            title="选择剧本（.md/.txt）或参考图/配音/视频上传——剧本全文随消息直接提交"
+            className="cursor-pointer rounded-lg border border-border bg-card px-2 text-muted-foreground transition-colors hover:bg-secondary/60 hover:text-foreground disabled:opacity-50"
+          >
+            {uploading ? <Loader2 className="size-3.5 animate-spin" /> : <Paperclip className="size-3.5" />}
+          </button>
           <button
             type="button"
             onClick={() => void send()}

@@ -5,7 +5,7 @@ Pydantic 校验失败 → llm_client 把错误清单回喂修复；修不好 →
 """
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 ScriptType = Literal["story", "screenplay", "storyboard", "ad", "materials_only"]
 
@@ -24,6 +24,9 @@ class ScreenplayBeat(BaseModel):
     description: str = ""
     narration: str = ""
     source_hint: str = ""
+    # 逐字原文（storyboard 必填）：该镜/片段在剧本里的完整原文，含 Reference 声明与
+    # H3 Prompt 全部小节。normalize 会用原文切片回收校准——LLM 转述必有损，保真靠原文
+    source_text: str = ""
 
     @field_validator("title")
     @classmethod
@@ -82,6 +85,34 @@ class PlanBatch(BaseModel):
     shots: list[ShotPlan] = Field(min_length=1)
     total: int = Field(ge=1, le=200)
     done: bool = False
+
+
+# H3 Ref2VA 六段式结构标记：prompt 必须六段齐全（non_diegetic_music 无音乐时写 N/A 也要有段名）
+H3_SECTION_MARKERS = (
+    "subject_definitions", "summary", "retention_analysis",
+    "detailed_description", "overall_soundscape", "non_diegetic_music",
+)
+
+
+class PlanBatchH3(PlanBatch):
+    """H3 参考生成模型的 plan 输出契约：prompt 必须是六段式结构（h3-prompt-writing skill）。
+
+    校验失败会被信封回喂修复——格式不合格的提示词绝不带病落盘（用户标准：
+    "提示词需要根据 h3 skill 进行润色，目前的提示词还是不合格的"）。
+    """
+
+    @model_validator(mode="after")
+    def _h3_sections(self) -> "PlanBatchH3":
+        for i, shot in enumerate(self.shots):
+            prompt = (shot.prompt or "").lower()
+            missing = [m for m in H3_SECTION_MARKERS if m not in prompt]
+            if missing:
+                raise ValueError(
+                    f"shots[{i}].prompt 缺少 H3 六段式必需段：{', '.join(missing)}"
+                    "（subject_definitions/summary/retention_analysis/detailed_description/"
+                    "overall_soundscape/non_diegetic_music 六段必须齐全，段名逐字使用，无音乐时 non_diegetic_music 段写 N/A）"
+                )
+        return self
 
 
 class BindDecision(BaseModel):

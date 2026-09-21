@@ -1,7 +1,7 @@
 """真实 LLM 端到端验证：用户 4 分镜剧本 → normalize+plan → 必须恰好 4 镜（H3 结构）。
 
 复现线上问题：4 分镜剧本被 plan 扩成 16 镜。本脚本用真实凭据跑 normalize+plan，
-断言 storyboard 类型判定、拍数=镜数、prompt 含 H3 关键结构（Action Timeline）。
+断言 storyboard 类型判定、拍数=镜数、prompt 为 H3 Ref2VA 六段式（h3-prompt-writing skill 契约）。
 数据隔离：DATA_DIR 指向临时目录（拷贝凭据），不碰真实项目。
 """
 import asyncio
@@ -65,9 +65,13 @@ async def main() -> int:
         failures.append(f"beats={len(sp['beats'])}，期望 4")
     if len(scenes) != 4:
         failures.append(f"scenes={len(scenes)}，期望 4")
+    H3_SECTIONS = ("subject_definitions", "summary", "retention_analysis",
+                   "detailed_description", "overall_soundscape", "non_diegetic_music")
     for i, s in enumerate(scenes):
-        if "Action Timeline" not in s["prompt"]:
-            failures.append(f"镜{i + 1} prompt 缺 Action Timeline")
+        low = s["prompt"].lower()
+        for marker in H3_SECTIONS:
+            if marker not in low:
+                failures.append(f"镜{i + 1} prompt 缺 H3 六段式段名 {marker}")
         if len(s["prompt"]) < 100:
             failures.append(f"镜{i + 1} prompt 过短（{len(s['prompt'])} 字）")
 

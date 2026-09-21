@@ -34,8 +34,18 @@ async def save_upload(kind: str, filename: str, content: bytes) -> dict:
     return {"url": f"/api/files/uploads/{kind}/{name}", "name": name, "size": len(content)}
 
 
-async def save_output(kind: str, content: bytes, ext: str | None = None) -> str:
-    name = f"{uuid.uuid4().hex[:12]}{ext or EXT_BY_KIND.get(kind, '.bin')}"
+def semantic_stem(text: str, limit: int = 48) -> str:
+    """台词/描述 → 安全文件名片段：只留 CJK 与字母数字（audio_semantic 的提取白名单），
+    天然排除 Windows 保留字符与分隔符；截长防路径溢出。"""
+    return "".join(re.findall(r"[\u4e00-\ufaffA-Za-z0-9]+", text or ""))[:limit]
+
+
+async def save_output(kind: str, content: bytes, ext: str | None = None, name_hint: str = "") -> str:
+    # uuid 前缀防同名冲突；name_hint（如 TTS 台词）让 URL 自带语义——分镜对号
+    # （素材清单/台词分发/编号互证）全靠从文件名提取台词，纯 uuid 名会全线脱靶
+    hint = semantic_stem(name_hint)
+    name = f"{uuid.uuid4().hex[:12]}_{hint}{ext or EXT_BY_KIND.get(kind, '.bin')}" if hint \
+        else f"{uuid.uuid4().hex[:12]}{ext or EXT_BY_KIND.get(kind, '.bin')}"
     dir_path = settings.OUTPUTS_DIR / kind
     dir_path.mkdir(parents=True, exist_ok=True)
     async with aiofiles.open(dir_path / name, "wb") as fh:

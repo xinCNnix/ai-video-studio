@@ -1,6 +1,6 @@
 "use client";
 
-import { Download, ImagePlus, Loader2, Play, Star, Trash2 } from "lucide-react";
+import { Clapperboard, Download, ImagePlus, Loader2, Play, Star, Trash2 } from "lucide-react";
 import { fileUrl } from "@/lib/api";
 import type { Job } from "@/lib/types";
 
@@ -16,6 +16,7 @@ export function ImageGrid({
   pending,
   onUseAsReference,
   onSendToVideo,
+  onSendToStudio,
   onOpenImage,
   onDeleteJob,
 }: {
@@ -23,6 +24,7 @@ export function ImageGrid({
   pending: boolean;
   onUseAsReference: (url: string) => void;
   onSendToVideo: (url: string) => void;
+  onSendToStudio: (url: string) => void;
   onOpenImage: (url: string) => void;
   onDeleteJob: (jobId: string) => void;
 }) {
@@ -88,6 +90,14 @@ export function ImageGrid({
                     className="flex size-8 cursor-pointer items-center justify-center rounded-lg bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
                   >
                     <Play className="size-4" />
+                  </button>
+                  <button
+                    type="button"
+                    title="发送到 Studio 作参考图（拆分镜后自动/手动分配）"
+                    onClick={() => onSendToStudio(tile.url)}
+                    className="flex size-8 cursor-pointer items-center justify-center rounded-lg bg-white/10 text-white backdrop-blur transition-colors hover:bg-white/20"
+                  >
+                    <Clapperboard className="size-4" />
                   </button>
                   <button
                     type="button"

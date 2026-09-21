@@ -25,6 +25,11 @@ async def upload_file(file: UploadFile = File(...), kind: str = Form("image")):
             result["text"] = content.decode("utf-8", errors="replace")[:60000]
         except Exception:  # noqa: BLE001
             result["text"] = ""
+    # 配音即刻返回精确时长：分镜时长要和台词对齐，用户在投放/绑定当场就要看到
+    if kind == "audio":
+        from ..services import voice_service
+
+        result["duration"] = await voice_service.probe_audio_seconds(result["url"])
     return result
 
 

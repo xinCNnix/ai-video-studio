@@ -1,6 +1,8 @@
-"""agent_v2_selfcheck：瘦工具循环 + 路由自检（隔离 DATA_DIR，不联网）。
+"""agent_v2_selfcheck：瘦工具循环 + 路由/意图分流自检（隔离 DATA_DIR，不联网）。
 
-覆盖：路由判定（剧本→pipeline_start / 继续生成→advance / 导出→export / 提问→tools）；
+覆盖：路由判定（空项目剧本→pipeline_start / 已有分镜的内容→classify 分流 /
+继续生成→advance / 导出→export / 提问→tools）；意图分流（voice/new_script/失败保守）；
+配音台词师子代理（长台词不重置分镜 + 工具硬白名单）；
 工具循环（get_project_state→update_scene→finish）；畸形输出熔断；取消即时返回；
 single-flight（agent 与 pipeline 互斥）。
 运行：.venv/Scripts/python.exe tests/agent_v2_selfcheck.py
@@ -50,12 +52,16 @@ def main() -> None:
         Scene(id="scene_x", title="镜1", prompt="完整的测试 prompt 内容", duration=5)))
 
     long_script = "这是一段足够长的剧本内容，" + "小墨走在上学的路上，阳光很好。" * 20
-    check("长剧本 → pipeline_start", agent_v2.route(long_script, proj) == "pipeline_start")
-    check("多行内容 → pipeline_start", agent_v2.route("第一行\n第二行\n第三行", proj) == "pipeline_start")
+    check("长剧本（空项目快照）→ pipeline_start", agent_v2.route(long_script, proj) == "pipeline_start")
+    check("多行内容（空项目快照）→ pipeline_start", agent_v2.route("第一行\n第二行\n第三行", proj) == "pipeline_start")
     proj = project_store.get(PID)  # 拿到带分镜的快照
+    check("长内容+已有分镜 → classify（防误重置分流）", agent_v2.route(long_script, proj) == "classify")
     check("继续生成 → pipeline_advance", agent_v2.route("继续生成", proj) == "pipeline_advance")
     check("提问 → tools", agent_v2.route("这个分镜的时长怎么改？", proj) == "tools")
     check("短指令无内容 → tools", agent_v2.route("帮我把镜1时长改成8秒", proj) == "tools")
+    # 无项目（全局侧栏）：带内容的长消息不得直通 pipeline_start（曾致"项目不存在"+失忆）
+    check("无项目+长内容 → tools（侧栏聊天带记忆）", agent_v2.route(long_script, None) == "tools")
+    check("无项目+多行台词 → tools", agent_v2.route("第一行\n第二行\n第三行", None) == "tools")
 
     # 导出（有视频的分镜才走 export）
     project_store.mutate(PID, lambda p: setattr(p.scenes[0].assets, "video", "/v.mp4"))
@@ -74,6 +80,40 @@ def main() -> None:
     orig_resolve = agent_v2.resolve_llm_call
     agent_v2.resolve_llm_call = fake_resolve
 
+    # ---------------- 意图分流（classify_content_intent） ----------------
+    def _trace(tag: str):
+        return agent_v2.trace_mod.RunTrace(tag, "-", "test")
+
+    FAKE = FakeLLM(['{"intent": "voice"}'])
+    check("分流 voice → tools_voice", asyncio.run(agent_v2.classify_content_intent(
+        "把台词转成 minimax 格式：……", None, None, _trace("t_cls_v"))) == "tools_voice")
+    FAKE = FakeLLM(['{"intent": "new_script"}'])
+    check("分流 new_script → pipeline_start", asyncio.run(agent_v2.classify_content_intent(
+        long_script, None, None, _trace("t_cls_n"))) == "pipeline_start")
+    FAKE = FakeLLM(['我觉得用户可能想重做视频吧'])
+    check("分流输出不合法 → 保守回 tools", asyncio.run(agent_v2.classify_content_intent(
+        long_script, None, None, _trace("t_cls_f"))) == "tools")
+
+    # ---------------- 配音台词师子代理（复现线上误重置场景） ----------------
+    voice_goal = "把下面台词转成 minimax 能接受的格式：\n" + "小墨推开门，风灌了进来，桌上的纸哗啦啦地飞。" * 8
+    FAKE = FakeLLM([
+        '{"intent": "voice"}',  # 路由分流
+        json.dumps({"action": "tool", "tool": "get_project_state", "args": {}}, ensure_ascii=False),
+        json.dumps({"action": "tool", "tool": "run_pipeline",
+                    "args": {"script_text": voice_goal}}, ensure_ascii=False),  # 模型越权：应被硬白名单拦下
+        json.dumps({"action": "finish", "reply": "已按 minimax-voice-tags 转换台词并交付台词块"}, ensure_ascii=False),
+    ])
+    result = asyncio.run(agent_v2.run_agent_v2(voice_goal, {"project_id": PID}))
+    check("长台词请求进配音模式而非重置分镜",
+          "台词" in result.get("reply", "") and len(project_store.get(PID)["scenes"]) == 1,
+          f"{result.get('reply', '')[:80]}")
+
+    agent_probe = agent_v2.AgentV2(PID, "探测", None, None)
+    agent_probe.persona = "voice"
+    r = asyncio.run(agent_probe.dispatch("run_pipeline", {"script_text": "y"}))
+    check("voice 人格硬禁 run_pipeline", r.get("ok") is False and "禁用" in r.get("error", ""), f"{r}")
+
+    # ---------------- 工具循环 ----------------
     tool_actions = [
         json.dumps({"action": "tool", "tool": "get_project_state", "args": {}}, ensure_ascii=False),
         json.dumps({"action": "tool", "tool": "update_scene",

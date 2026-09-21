@@ -9,6 +9,7 @@ import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import { Textarea } from "@/components/ui/textarea";
 import { Waveform } from "./waveform";
 
 const SAMPLE_EXTS = [".mp3", ".wav"];
@@ -182,12 +183,15 @@ function CloneSampleRow({
  * 与配音（预置音色）/声音设计（文字描述）界面完全分离。
  */
 export function CloneVoicePanel({
+  modelId,
   assets,
   selected,
   onSelect,
   onDelete,
   onCreated,
 }: {
+  /** 当前语音模型 ID：本地 Higgs 克隆需要逐字稿（ref_text），小米/MiniMax 不需要 */
+  modelId: string;
   assets: VoiceAsset[];
   selected: string;
   onSelect: (a: VoiceAsset) => void;
@@ -201,6 +205,7 @@ export function CloneVoicePanel({
   const [pendingFile, setPendingFile] = useState<File | null>(null);
   const [pendingUrl, setPendingUrl] = useState("");
   const [pendingName, setPendingName] = useState("");
+  const [pendingRefText, setPendingRefText] = useState("");
   const [saving, setSaving] = useState(false);
   const [playingId, setPlayingId] = useState<string | null>(null);
   const [previewPlaying, setPreviewPlaying] = useState(false);
@@ -213,6 +218,7 @@ export function CloneVoicePanel({
     (c) => c.provider === "minimax" || (c.base_url || "").toLowerCase().includes("minimax")
   );
   const [syncMinimax, setSyncMinimax] = useState(true);
+  const isHiggs = (modelId || "").toLowerCase().includes("higgs");
 
   // 克隆音色 = 带样本的固化资产（含此前 voicedesign 固化的与本次上传的）
   const clones = assets.filter((a) => a.kind === "clone" && a.has_sample);
@@ -249,6 +255,11 @@ export function CloneVoicePanel({
       toast.error("请给这个克隆音色起个名字（如：我的声音）");
       return;
     }
+    const refText = pendingRefText.trim();
+    if (isHiggs && !refText) {
+      toast.error("Higgs 本地克隆需要样本逐字稿：样本里念了什么就一字不差地写什么");
+      return;
+    }
     setSaving(true);
     try {
       const up = await api.upload(pendingFile, "audio");
@@ -257,11 +268,14 @@ export function CloneVoicePanel({
         name,
         kind: "clone",
         sample_from: up.url,
+        ref_text: refText,
         sync_minimax: wantMinimax,
       });
       if (asset.minimax_error) {
-        // 资产本身已保存（小米样本克隆可用），仅 MiniMax 侧失败
+        // 资产本身已保存（小米/本地样本克隆可用），仅 MiniMax 侧失败
         toast.warning(`音色「${name}」已保存，但 MiniMax 克隆失败：${asset.minimax_error}`);
+      } else if (isHiggs) {
+        toast.success(`克隆音色「${name}」已保存：Higgs 本地生成时将以它为音色样本`);
       } else if (wantMinimax) {
         toast.success(`克隆音色「${name}」已保存：小米即时可用，MiniMax speech 模型同步可用`);
       } else {
@@ -271,6 +285,7 @@ export function CloneVoicePanel({
       setPendingFile(null);
       setPendingUrl("");
       setPendingName("");
+      setPendingRefText("");
       onCreated(asset);
     } catch (err) {
       toast.error((err as Error).message);
@@ -398,6 +413,20 @@ export function CloneVoicePanel({
               {saving ? <Loader2 className="size-3.5 animate-spin" /> : "保存为克隆音色"}
             </Button>
           </div>
+          {isHiggs && (
+            <div className="space-y-1">
+              <Textarea
+                value={pendingRefText}
+                onChange={(e) => setPendingRefText(e.target.value)}
+                placeholder="样本逐字稿（Higgs 本地克隆必填）：样本里念了什么就写什么，一字不差"
+                className="min-h-[56px] resize-none text-xs"
+                rows={3}
+              />
+              <p className="text-[10px] leading-relaxed text-muted-foreground/70">
+                逐字稿与样本对得越准，克隆出的音色越像。左侧 Emotion/Speed 与正文标签仍可正常叠加使用。
+              </p>
+            </div>
+          )}
           {saving && syncMinimax && hasMinimaxKey ? (
             <div className="flex items-center gap-1.5 text-[10px] text-muted-foreground">
               <Loader2 className="size-3 animate-spin" />
@@ -416,8 +445,9 @@ export function CloneVoicePanel({
             </label>
           ) : (
             <p className="text-[10px] leading-relaxed text-muted-foreground/70">
-              仅保存小米样本克隆。添加 MiniMax Key（设置 → API Keys）后可同步克隆，
-              speech 系列模型即可以真实参数使用该音色。
+              {isHiggs
+                ? "带逐字稿的样本将用于 Higgs 本地克隆。添加 MiniMax Key（设置 → API Keys）后可同步克隆到 speech 系列模型。"
+                : "仅保存小米样本克隆。添加 MiniMax Key（设置 → API Keys）后可同步克隆，speech 系列模型即可以真实参数使用该音色。"}
             </p>
           )}
           <audio

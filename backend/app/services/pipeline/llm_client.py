@@ -12,6 +12,7 @@ from typing import TypeVar
 from pydantic import BaseModel, ValidationError
 
 from ...harness.errors import FatalError, RetryableError
+from ...providers.base import ProviderError
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -180,10 +181,14 @@ class LLMEnvelope:
                     self.trace.log("llm_call", model=self.model, attempt=attempt + 1,
                                    user_tail=(messages[-1]["content"] or "")[-300:])
                 out = await self.llm.generate(messages, self.model, temperature=temperature, max_tokens=max_tokens)
+                if not (out or "").strip():
+                    # 空输出多为服务端抖动/限流：按网络错误退避重试，不烧宝贵的修复轮次
+                    # （事故：超长 plan 消息连续 3 轮空输出，修复轮次耗尽直接 Fatal）
+                    raise ProviderError("模型返回空输出")
                 if self.trace:
                     self.trace.count("llm_calls")
                     self.trace.log("llm_result", chars=len(out or ""), tail=(out or "")[-300:])
-                return out or ""
+                return out
             except Exception as exc:  # noqa: BLE001 - 网络/限流统一走重试
                 last_exc = exc
                 if self.trace:

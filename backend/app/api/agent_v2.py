@@ -1,8 +1,8 @@
 """Agent API（/api/agent，v2 实现）。
 
-- run / run/stream：v2 agent（创作直通 pipeline、修改走瘦工具循环）
-  SSE 协议保持旧格式（{"type":"step","step":{...}} / {"type":"final","result":{...}}），
-  非 Studio 页的旧侧栏零改动可用
+- run / run/stream：v2 agent（Studio：创作直通 pipeline、修改走瘦工具循环；
+  非 Studio 页的全局侧栏不带 project_id，走无项目聊天/文字加工路径，两不串台）
+  SSE 协议保持旧格式（{"type":"step","step":{...}} / {"type":"final","result":{...}}）
 - chat：纯聊天（Prompt 页/无项目上下文），无工具
 - skills / llm-options / cancel：与旧版一致
 """
@@ -14,6 +14,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
+from ..harness import trace as trace_mod
 from ..providers.base import ProviderError
 from ..providers.registry import resolve_llm_call
 from ..services import agent_v2, skill_service
@@ -138,6 +139,9 @@ async def run_stream(req: AgentRunRequest):
     async def event_gen():
         queue: asyncio.Queue = asyncio.Queue()
         step_no = 0
+        # run_id 在流首发给客户端：侧栏「停止」据此精确取消本 run，
+        # 不再走空 run_id 的"取消全部"（会误杀 Studio 里正在跑的 agent）
+        run_id = trace_mod.new_run_id("agent")
 
         def on_step(event: dict) -> None:
             nonlocal step_no
@@ -156,9 +160,10 @@ async def run_stream(req: AgentRunRequest):
         task = asyncio.create_task(
             agent_v2.run_agent_v2(
                 req.goal.strip(), _context(req), req.credential_id, req.model,
-                history=_sanitize_history(req.history), on_step=on_step,
+                history=_sanitize_history(req.history), on_step=on_step, run_id=run_id,
             )
         )
+        yield _sse({"type": "started", "run_id": run_id})
         while True:
             try:
                 step = queue.get_nowait()

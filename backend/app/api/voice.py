@@ -1,4 +1,6 @@
 """AI 语音（TTS）生成 API + 音色资产管理（设计音色固化/复用）。"""
+import uuid
+
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
@@ -10,6 +12,9 @@ from ..providers.base import ProviderError
 from ..services import file_service, voice_service
 
 router = APIRouter(prefix="/api/voice", tags=["voice"])
+
+# 音色设计默认试听文本：句式长短交错，便于听清语速与韵律
+DEFAULT_DESIGN_PREVIEW = "你好，我是你的专属音色。今天天气不错，正适合坐下来，慢慢聊聊天。"
 
 
 class VoiceRequest(BaseModel):
@@ -59,6 +64,7 @@ class SaveAssetRequest(BaseModel):
     kind: str = "clone"  # clone=带样本固化（推荐） / design=仅描述
     desc: str = ""
     sample_from: str | None = None  # 任务输出/上传音频的 URL（mp3/wav）
+    ref_text: str = ""  # 样本逐字稿：本地 Higgs TTS 克隆需要，其他厂商忽略
     sync_minimax: bool = False  # 同时克隆到 MiniMax 服务端（生成永久 voice_id）
     credential_id: str | None = None  # MiniMax 凭据（缺省自动解析默认 Key）
 
@@ -122,7 +128,8 @@ async def create_asset(req: SaveAssetRequest):
         if sample_src is None:
             raise HTTPException(status_code=400, detail="sample_from 必须是本服务的音频文件 URL（任务输出或上传）")
     try:
-        asset = voice_assets.create_asset(req.name.strip(), req.kind, req.desc, sample_src)
+        asset = voice_assets.create_asset(req.name.strip(), req.kind, req.desc, sample_src,
+                                          ref_text=req.ref_text)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # 同步克隆到 MiniMax：失败不阻断资产保存（小米样本克隆仍可用），错误随资产带回前端提示
@@ -142,6 +149,43 @@ async def clone_asset_to_minimax(asset_id: str, req: CloneMinimaxRequest | None 
         raise HTTPException(status_code=404, detail="音色资产不存在")
     body = req or CloneMinimaxRequest()
     return _public_with_error(asset_id, await _clone_asset_to_minimax(asset_id, body.credential_id))
+
+
+class DesignMinimaxRequest(BaseModel):
+    name: str = Field(min_length=1)
+    prompt: str = Field(min_length=1)  # 音色描述（即设计模式的 Voice 输入）
+    preview_text: str = ""  # 试听文本，留空用默认（≤500 字符，按字符计费）
+    credential_id: str | None = None
+
+
+@router.post("/design-minimax")
+async def design_minimax_voice(req: DesignMinimaxRequest):
+    """文字描述 → MiniMax 永久音色（/v1/voice_design 文生音色）。
+
+    与小米 voicedesign 的"同描述每次漂移"不同：MiniMax 一次设计产出服务端永久
+    voice_id，记入资产 minimax_voice_id 后 speech 系列模型稳定复用。试听音频
+    固化为资产样本（ref_text=试听文本），小米 voiceclone / Higgs 克隆同样可用。
+    """
+    prompt = req.prompt.strip()
+    name = req.name.strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="音色描述不能为空")
+    if not name:
+        raise HTTPException(status_code=400, detail="音色名不能为空")
+    preview = (req.preview_text or "").strip() or DEFAULT_DESIGN_PREVIEW
+    try:
+        mm = registry.get_minimax_tts(req.credential_id)
+        voice_id, audio = await mm.design_voice(prompt, preview)
+    except ProviderError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    # 试听音频先落样本目录再建资产（Windows 下跨句柄安全：写完即关，拷贝后删除）
+    tmp = voice_assets.SAMPLES_DIR / f"design_{uuid.uuid4().hex}.mp3"
+    tmp.write_bytes(audio)
+    try:
+        asset = voice_assets.create_asset(name, "clone", prompt, tmp, ref_text=preview)
+    finally:
+        tmp.unlink(missing_ok=True)
+    return voice_assets.set_minimax_voice(asset["id"], voice_id) or asset
 
 
 @router.delete("/assets/{asset_id}")

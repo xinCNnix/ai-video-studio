@@ -15,11 +15,40 @@ def norm_tts_text(t: str) -> str:
 
 
 def audio_semantic(url_or_name: str) -> str:
-    """从上传音频文件名提取语义文本（用户上传名自带台词前缀，如 xxxx_tts_085821_哎呀！原来…）。"""
+    """从上传音频文件名提取语义文本（用户上传名自带台词前缀，如 xxxx_tts_085821_哎呀！原来…）。
+
+    纯数字前缀（排序号"02台词…"、tts 时间戳残留"085821台词…"）不属于台词本体，
+    一律剥掉——带着它做包含匹配会全线脱靶（复现事故：6 句配音 5 句"没有命中任何分镜"，
+    全部因为文件名带 02-06 序号前缀）。
+
+    纯十六进制串（uuid 命名的生成产物，如 a3f8b2c1d4e5）不是台词——返回空，
+    避免"台词摘要：a3f8b2c1d4e5"这类垃圾进素材清单误导分镜。
+    """
     name = (url_or_name or "").rsplit("/", 1)[-1].rsplit(".", 1)[0]
     if "_" in name:
         name = name.rsplit("_", 1)[-1]
-    return "".join(re.findall(r"[\u4e00-\ufaffA-Za-z0-9]+", name))
+    text = "".join(re.findall(r"[\u4e00-\ufaffA-Za-z0-9]+", name))
+    text = re.sub(r"^\d+", "", text)
+    if re.fullmatch(r"[0-9a-fA-F]{6,}", text):
+        return ""
+    return text
+
+
+def synthesize_audio_filename(url: str, text: str) -> str:
+    """旧格式音频（uuid 命名、文件名提不出台词）+ 已知台词 → 合成语义文件名。
+
+    与 save_output 新格式同构（{url自带id}_{台词}）：语义提取、同台词去重、
+    素材池判重全部按同一规则工作；id 取自 URL 故全局唯一，不折叠不同副本。
+    提得出语义（新格式/用户上传名）或无台词时原样返回 url 尾段。
+    """
+    if not text or not str(text).strip():
+        return url.rsplit("/", 1)[-1]
+    if audio_semantic(url):
+        return url.rsplit("/", 1)[-1]
+    stem = url.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    ext = url.rsplit("/", 1)[-1].rsplit(".", 1)[1] if "." in url.rsplit("/", 1)[-1] else "mp3"
+    hint = "".join(re.findall(r"[\u4e00-\ufaffA-Za-z0-9]+", str(text)))[:48]
+    return f"{stem}_{hint}.{ext}" if hint else url.rsplit("/", 1)[-1]
 
 
 def dedupe_same_text_audios(audios: list[str]) -> tuple[list[str], list[str]]:
@@ -70,37 +99,17 @@ def asset_name_tokens(url: str) -> list[str]:
     return toks
 
 
-def sort_ref_assets_by_prompt(urls: list[str], prompt: str, label: str) -> list[str]:
-    """参考图/参考视频按 Prompt 的 <Picture N> / <Video N> 声明顺序对齐（稳定排序）。
+_UPLOAD_HASH_PREFIX_RE = re.compile(r"^[0-9a-f]{8}_")
 
-    身份绑定写在声明行里——错位即张冠李戴。同一编号的声明行可能多处出现，按 N
-    合并后匹配：文件名身份 token 出现在哪个编号的声明文本里就排第 N 位；文件名无
-    语义时若素材数与声明编号数一致，用消元法把无信号素材按原相对顺序补进空缺编号。
-    两类信号都没有的保持原序排在末尾。
-    """
-    decl: dict[int, str] = {}
-    for n, line in re.findall(rf"<{label}\s+(\d+)>([^<\n]*)", prompt or ""):
-        k = int(n)
-        decl[k] = f"{decl.get(k, '')} {line}"
-    if not decl or not urls:
-        return list(urls)
-    norm = {n: norm_tts_text(t).lower() for n, t in decl.items()}
-    rank: dict[str, int | None] = {}
-    for u in urls:
-        toks = [t for t in asset_name_tokens(u) if len(t) >= 2]
-        rank[u] = min(
-            (n for n, nl in norm.items() if any(t in nl for t in toks)),
-            default=None,
-        )
-    bound = [u for u in urls if rank[u] is not None]
-    unbound = [u for u in urls if rank[u] is None]
-    if len(urls) == len(decl) and len(unbound) == len(decl) - len(set(rank[u] for u in bound)):
-        free_ns = sorted(set(decl) - {rank[u] for u in bound})
-        for u, n in zip(unbound, free_ns):
-            rank[u] = n
-        bound, unbound = urls, []
-    order = {u: i for i, u in enumerate(urls)}
-    return sorted(bound, key=lambda u: (rank[u], order[u])) + unbound
+
+def semantic_file_key(name_or_url: str) -> str:
+    """素材文件身份键：剥上传服务加的 8 位哈希前缀与扩展名、去空白。
+
+    `61b19f99_lvmanchun.png` 与 `964f0b41_lvmanchun.png` 同键（整包重传的同一张图）；
+    `04281dce-….png` 这类 UUID 原名全保留。素材池按此键折叠重复拷贝。"""
+    name = (name_or_url or "").rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    name = _UPLOAD_HASH_PREFIX_RE.sub("", name)
+    return re.sub(r"\s+", "", name).lower()
 
 
 def pick_matching_audios(audios: list[str], prompt: str, narration: str, limit: int = 3) -> tuple[list[str], list[str]]:
@@ -184,3 +193,33 @@ def renumber_audio_tags(prompt: str, audios: list[str]) -> tuple[str, str | None
     new_prompt = _AUDIO_TAG_RE.sub(lambda m: f"<Audio {mapping[int(m.group(1))]}>", prompt)
     changed = "、".join(f"<Audio {n}>→<Audio {mapping[n]}>" for n in tags if mapping[n] != n)
     return new_prompt, f"Prompt 音频标签为全片全局编号（{changed}），已按本镜实际传入的 {len(audios)} 段音频重排"
+
+
+# 编号引用两种形态：<Audio N> 标签，与原文块 Audio Timeline 的裸行（"0-6s｜Audio 3｜吕满春"）。
+# 括号可选捕获保证标签形态原样保留尖括号；数字整体捕获防 12 截出 2
+_REF_NUM_RE = re.compile(r"(<)?(Audio|Video)\s+(\d+)\s*(>)?", re.A)
+
+
+def remap_ref_numbers(prompt: str, audio_map: dict[int, int], video_map: dict[int, int] = None) -> tuple[str, str | None]:
+    """按映射表把 Prompt 全文的音频/视频编号改号（标签与裸行都改，映射外号码不动）。
+
+    bind 对齐用：原稿片段原文块沿用全集全局编号（<Audio 3>＝全片第 3 段台词），
+    润色正文却是本镜编号——同一段音频两个号码，组装闸门数出 2 个标签配 1 段音频
+    即拦截（复现事故：第 2/3/4 镜全被"多余标签指向不存在的素材"拦下）。映射
+    {全局号: 本镜号} 来自原稿 Reference 声明 ↔ 本镜绑定顺序，两域统一后闸门
+    放行。返回（新 Prompt，变更说明或 None）。
+    """
+    maps = {"Audio": audio_map or {}, "Video": video_map or {}}
+    if not any(maps.values()):
+        return prompt, None
+    hits: list[str] = []
+
+    def _sub(m: re.Match) -> str:
+        n = int(m.group(3))
+        k = maps[m.group(2)].get(n)
+        if k is None or k == n:
+            return m.group(0)
+        hits.append(f"<{m.group(2)} {n}>→<{m.group(2)} {k}>")
+        return f"{m.group(1) or ''}{m.group(2)} {k}{m.group(4) or ''}"
+
+    return _REF_NUM_RE.sub(_sub, prompt), ("、".join(dict.fromkeys(hits)) or None)

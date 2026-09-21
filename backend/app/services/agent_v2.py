@@ -1,10 +1,11 @@
 """Agent v2：瘦工具循环（约 500 行，替代旧 2336 行巨石）。
 
-职责收缩为三件事：
-1. 路由：创作类请求（带剧本/素材）→ pipeline；生成/继续 → pipeline 续跑；
-   其余 → LLM 工具循环
+职责收缩为四件事：
+1. 路由：导出/续跑直通；带内容的请求在空项目直走 pipeline（零 LLM），在已有
+   分镜的项目先做一次 LLM 意图分流（new_script/voice/other）——台词加工类请求
+   进"配音台词师"子代理，防止长台词被误当新剧本投放而整表重置
 2. 工具循环：全部工具是 harness/store/pipeline/generation_service 的薄封装，
-   没有任何业务规则副本
+   没有任何业务规则副本；子代理人格在 dispatch 层有工具硬白名单
 3. 免 LLM 直通：导出/续跑等确定性指令不烧模型调用
 
 稳定性（harness 兜底，不依赖模型自觉）：
@@ -21,14 +22,14 @@ from ..harness.state import ImageBinding, clamp_duration
 from ..harness.watchdog import watchdog
 from ..jobs import job_manager
 from ..providers.registry import resolve_llm_call
-from . import export_service, generation_service, project_store, skill_service
+from . import export_service, generation_service, project_store, prompt_timing, skill_service
 from .pipeline import llm_client
 
 MAX_STEPS = 40
 MAX_BAD_OUTPUT_STREAK = 3
 MAX_SAME_TOOL_ERRORS = 4
 
-SYSTEM_PROMPT = """你是 AI Video Studio 的创作助理，操作一个分镜项目（v2 状态模型）。
+_TOOL_CONTRACT = """你是 AI Video Studio 的创作助理，操作一个分镜项目（v2 状态模型）。
 
 项目结构：materials（素材池：图/音频/视频/剧本）、scenes（分镜：prompt/narration/duration/gen_mode/binding/assets）、
 pipeline（阶段：intake→normalize→plan→bind→review→generate→assemble）、pending_bindings（待确认素材归属）。
@@ -43,18 +44,39 @@ pipeline（阶段：intake→normalize→plan→bind→review→generate→assem
    挂有用户素材的分镜其内容视为用户定稿，重写需用户明示。
 5. add_scene / delete_scene —— 增删分镜（args: {"scene_id": "...", "index": 可选插入位置}）。
 6. bind_material / unbind_material —— 调整素材归属（args: {"material_id": "...", "scene_id": "...", "kind": "image|audio|video", "role": "reference|first_frame"}）。
-7. generate_for_scene —— 单镜生成（args: {"scene_id": "...", "kinds": ["keyframe","voice","video"] 起码一项}）。
+7. generate_for_scene —— 单镜生成（args: {"scene_id": "...", "kinds": ["keyframe","voice","video"] 起码一项；已有视频/配音要重出时加 "force": true}）。
 8. export_project —— 拼接成片。
 9. load_skill —— 读取创作方法论（{"name": "screenwriting"} 等）。
 10. read_doc —— 读上传的剧本文档全文（{"url": "/api/files/uploads/doc/..."}）。
-11. query_jobs / wait_job —— 查任务/等任务终态。
+11. query_jobs / wait_job —— 查任务/等任务终态。"""
 
-行为准则：
-- 用户给剧本/分镜稿/素材 → run_pipeline（把用户消息全文作为 script_text，附件 URL 放 materials）
+_PRODUCTION_RULES = """
+行为准则（主代理：导演/制片）：
+- 用户意图是投放或更换剧本（"这是新剧本""重新拆分镜"）→ run_pipeline（用户消息全文作
+  script_text，附件 URL 放 materials）。反面：用户给台词/旁白让你润色、转配音格式、加
+  停顿语气标记——那是文字加工，绝不 run_pipeline（项目已有分镜时它会整表重置），
+  只在文本上工作，或 update_scene 改对应镜的 narration。
 - 用户说"继续/生成/出片" → advance_pipeline {"confirmed": true}
 - 用户问状态/求建议 → 先 get_project_state 再答
 - 修改后告诉用户改了什么；生成类操作返回的都是后台任务，不用等
+- 台词表现力（用户要情感/停顿/拟声/格式化）：看 settings.voice_model——含 higgs →
+  load_skill {"name": "higgs-voice-tags"}；speech- 开头（MiniMax）→
+  load_skill {"name": "minimax-voice-tags"}；小米/OpenAI 没有标记体系，别往文本里写标签
 - 不知道就问，不要瞎编分镜内容覆盖用户定稿"""
+
+_VOICE_RULES = """
+行为准则（子代理：配音台词师）：
+- 你只做台词文字加工：润色、断句分段、转目标 TTS 格式、加停顿/语气/注音标记，不碰分镜结构。
+- 先 get_project_state 看 settings.voice_model 选技能：含 higgs → load_skill
+  {"name": "higgs-voice-tags"}；speech- 开头（MiniMax）→ load_skill {"name": "minimax-voice-tags"}；
+  小米/OpenAI 无标记体系，只做纯文本润色。按技能里的转换流程和密度上限加工，
+  交付可直接粘贴的台词块（代码块包裹）+ 一两句改动说明。
+- 用户明示写入哪一镜时才用 update_scene 改 narration；不确定哪镜就问。
+- 以下工具对本代理禁用（系统层同样会拦）：run_pipeline / advance_pipeline / add_scene /
+  delete_scene / bind_material / unbind_material / export_project。用户真要重拆分镜、
+  重做视频时，让他另发一条明确指令（如"投放新剧本重新拆分镜"）。"""
+
+SYSTEM_PROMPT = _TOOL_CONTRACT + _PRODUCTION_RULES
 
 # ---------------- 取消旗标（按 run 隔离） ----------------
 _CANCEL_FLAGS: dict[str, bool] = {}
@@ -104,14 +126,56 @@ def _wants_export(goal: str) -> bool:
 
 
 def route(goal: str, project: dict | None) -> str:
-    """返回 pipeline_start / pipeline_advance / export / tools。"""
-    if _wants_export(goal) and project and any(s.get("assets", {}).get("video") for s in project.get("scenes", [])):
+    """返回 pipeline_start / classify / pipeline_advance / export / tools。
+
+    无项目（全局助手侧栏）：一律 tools——侧栏只做问答/文字加工且依赖对话历史，
+    带内容的长消息（粘贴台词润色、把上一轮结果贴回再改）曾因"内容长就是剧本"
+    被直通 pipeline_start，零 LLM 且无项目直接报"项目不存在"，用户侧表现为失忆。
+
+    带内容的消息：空项目无破坏面，保持零 LLM 直通 pipeline_start；已有分镜时
+    返回 classify，由 classify_content_intent 分流——长台词加工请求曾因"内容长
+    就是剧本"的误判直通 run_pipeline，把用户分镜整表重置过。
+    """
+    if not project:
+        return "tools"
+    if _wants_export(goal) and any(s.get("assets", {}).get("video") for s in project.get("scenes", [])):
         return "export"
     if _goal_carries_content(goal):
-        return "pipeline_start"
+        return "pipeline_start" if not (project or {}).get("scenes") else "classify"
     if _wants_advance(goal, project):
         return "pipeline_advance"
     return "tools"
+
+
+async def classify_content_intent(goal: str, credential_id: str | None, model: str | None,
+                                  trace=None) -> str:
+    """内容型消息 + 项目已有分镜时的意图分流，返回 pipeline_start / tools_voice / tools。
+
+    误投 run_pipeline 是破坏性操作（整表重置），这里花一次小模型调用兜底；
+    模型不可用或输出不合法时保守回 tools（工具循环里还能纠正，反方向救不回来）。
+    """
+    prompt = (
+        "判断用户这条消息的意图，只输出 JSON：{\"intent\": \"new_script|voice|other\"}\n"
+        "- new_script：投放/更换剧本，期望重拆分镜、重做视频\n"
+        "- voice：给台词/旁白文本做加工（润色、转配音格式、加停顿/语气标记、写旁白文案），不改分镜结构\n"
+        "- other：其他（改分镜参数、问状态、继续生成、闲聊等）\n\n"
+        f"用户消息：\n{goal[:3000]}"
+    )
+    try:
+        llm, mdl = resolve_llm_call(credential_id, provider_hint="minimax", model=model)
+        raw = await llm_client.LLMEnvelope(llm, mdl, trace).raw_call(
+            [{"role": "user", "content": prompt}], temperature=0, max_tokens=2000)
+    except Exception as exc:  # noqa: BLE001 - 分类失败保守走工具循环
+        if trace:
+            trace.log("route_classify_error", error=str(exc)[:200])
+        return "tools"
+    intent = ""
+    for data in llm_client.parse_json_candidates(raw):
+        intent = str(data.get("intent") or "").strip().lower()
+        break
+    if trace:
+        trace.log("route_classified", intent=intent)
+    return {"new_script": "pipeline_start", "voice": "tools_voice"}.get(intent, "tools")
 
 
 # ---------------- 项目工具（全部薄封装，无规则副本） ----------------
@@ -177,7 +241,11 @@ def tool_update_scene(agent, args: dict) -> dict:
         if args.get("gen_mode") in ("i2v", "t2v"):
             s.gen_mode = args["gen_mode"]
         if args.get("duration") is not None:
-            s.duration = clamp_duration(int(args["duration"]), p.settings.video_model)
+            new_duration = clamp_duration(int(args["duration"]), p.settings.video_model)
+            if new_duration != s.duration and s.prompt:
+                # 与 patch_scene 同一契约：改时长必须同步缩放 Prompt 时间引用
+                s.prompt, _ = prompt_timing.rescale_prompt_timing(s.prompt, s.duration, new_duration)
+            s.duration = new_duration
         s.revision += 1
 
     try:
@@ -305,7 +373,8 @@ async def tool_generate_for_scene(agent, args: dict) -> dict:
                 use_uploaded=bool(args.get("use_uploaded")), force=bool(args.get("force")),
                 trace=agent.trace)
         else:
-            results["video"] = generation_service.submit_scene_video(agent.project_id, scene_id, trace=agent.trace)
+            results["video"] = await generation_service.submit_scene_video(
+                agent.project_id, scene_id, force=bool(args.get("force")), trace=agent.trace)
     ok = all(r.get("ok") for r in results.values() if isinstance(r, dict))
     return {"ok": ok, "results": results}
 
@@ -376,6 +445,13 @@ async def tool_wait_job(agent, args: dict) -> dict:
 
 # ---------------- Agent 主体 ----------------
 
+# 配音台词师子代理禁用的工具：全是改分镜结构/触发整表重置/出片类操作，
+# 与台词文字加工无关。提示词里声明一份，这里再硬拦一份（不依赖模型自觉）。
+VOICE_FORBIDDEN_TOOLS = {
+    "run_pipeline", "advance_pipeline", "export_project",
+    "add_scene", "delete_scene", "bind_material", "unbind_material",
+}
+
 
 class AgentV2:
     def __init__(self, project_id: str | None, goal: str, credential_id: str | None, model: str | None,
@@ -389,6 +465,7 @@ class AgentV2:
         self.run_id = run_id or trace_mod.new_run_id("agent")
         self.trace = trace_mod.RunTrace(self.run_id, project_id or "-", "agent", meta={"goal": goal[:200]})
         self.jobs: list[dict] = []
+        self.persona = "production"  # production=主代理 / voice=配音台词师
 
     def step(self, event: dict) -> None:
         if self.on_step:
@@ -397,6 +474,9 @@ class AgentV2:
     # ---------- 工具分发 ----------
 
     async def dispatch(self, tool: str, args: dict) -> dict:
+        if self.persona == "voice" and tool in VOICE_FORBIDDEN_TOOLS:
+            self.trace.log("tool_blocked", tool=tool, persona="voice")
+            return {"ok": False, "error": f"配音台词模式禁用 {tool}（防误重置分镜）。需要重拆分镜请让用户另发明确指令。"}
         if tool == "get_project_state":
             return tool_get_project_state(self)
         if tool == "update_scene":
@@ -440,6 +520,8 @@ class AgentV2:
     async def run(self) -> dict:
         project = project_store.get(self.project_id) if self.project_id else None
         mode = route(self.goal, project)
+        if mode == "classify":
+            mode = await classify_content_intent(self.goal, self.credential_id, self.model, self.trace)
         self.trace.log("route", mode=mode)
         self.step({"type": "route", "mode": mode})
         try:
@@ -450,7 +532,7 @@ class AgentV2:
             elif mode == "export":
                 result = await self._direct_export()
             else:
-                result = await self._tool_loop(project)
+                result = await self._tool_loop(project, persona="voice" if mode == "tools_voice" else "production")
             self.trace.end("done", mode=mode)
             return result
         except RunBusyError as exc:
@@ -484,6 +566,8 @@ class AgentV2:
             r = start_pipeline(self.project_id, payload, self.credential_id, self.model)
         except RunBusyError:
             return {"reply": "该项目已有任务在进行中，请稍候再试。", "jobs": [], "run_id": self.run_id}
+        except ProjectNotFoundError:
+            return {"reply": "项目不存在（可能已被删除），请刷新页面后重试。", "jobs": [], "run_id": self.run_id}
         reply = (
             "已启动流水线：剧本解析 → 分镜规划 → 素材分配，完成后会在确认面板等你确认再生成。"
             "进度实时显示在分镜看板上。"
@@ -511,24 +595,35 @@ class AgentV2:
 
     # ---------- LLM 工具循环 ----------
 
-    async def _tool_loop(self, project) -> dict:
+    def _history_messages(self) -> list[dict]:
+        """近 8 轮对话历史（无项目聊天路径与工具循环共用）。"""
+        out = []
+        for h in self.history[-8:]:
+            role = h.get("role")
+            content = str(h.get("content") or "")[:2000]
+            if role in ("user", "assistant") and content:
+                out.append({"role": role, "content": content})
+        return out
+
+    async def _tool_loop(self, project, persona: str = "production") -> dict:
+        self.persona = persona
         if not self.project_id or not project:
-            # 无项目上下文：纯聊天
+            # 无项目上下文（非 Studio 页的全局助手侧栏）：纯聊天/文字加工，带对话记忆
             llm, model = resolve_llm_call(self.credential_id, provider_hint="minimax", model=self.model)
             reply = await llm_client.LLMEnvelope(llm, model, self.trace).raw_call(
-                [{"role": "system", "content": "你是 AI 视频创作助理。当前没有打开的项目，引导用户到 Studio 创建/打开项目并投放剧本。"},
+                [{"role": "system", "content": "你是 AI Video Studio 的全局 AI 助手（非 Studio 页的侧栏）。"
+                                               "当前没有项目上下文：分镜、生成、导出等创作流程请用户到 Studio "
+                                               "用页面自带的 Agent 控制台；提问、改 Prompt、润色台词、"
+                                               "配音格式转换、写文案等纯文字请求直接完成。"},
+                 *self._history_messages(),
                  {"role": "user", "content": self.goal}],
             )
             return {"reply": reply, "jobs": [], "run_id": self.run_id}
 
         llm, model = resolve_llm_call(self.credential_id, provider_hint="minimax", model=self.model)
         envelope = llm_client.LLMEnvelope(llm, model, self.trace)
-        messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-        for h in self.history[-8:]:
-            role = h.get("role")
-            content = str(h.get("content") or "")[:2000]
-            if role in ("user", "assistant") and content:
-                messages.append({"role": role, "content": content})
+        messages: list[dict] = [{"role": "system", "content": _TOOL_CONTRACT + (_VOICE_RULES if persona == "voice" else _PRODUCTION_RULES)}]
+        messages.extend(self._history_messages())
         context_state = tool_get_project_state(self)
         messages.append({"role": "user", "content": f"当前项目状态：{context_state}\n\n用户请求：{self.goal}"})
 
@@ -613,7 +708,7 @@ def _strip_attachment_block(goal: str) -> str:
 
 
 async def run_agent_v2(goal: str, context: dict, credential_id: str | None = None, model: str | None = None,
-                        history: list[dict] | None = None, on_step=None) -> dict:
+                        history: list[dict] | None = None, on_step=None, run_id: str | None = None) -> dict:
     agent = AgentV2(
         project_id=(context or {}).get("project_id"),
         goal=goal,
@@ -621,6 +716,7 @@ async def run_agent_v2(goal: str, context: dict, credential_id: str | None = Non
         model=model,
         history=history,
         on_step=on_step,
+        run_id=run_id,
     )
     try:
         if agent.project_id:

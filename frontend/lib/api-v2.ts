@@ -61,13 +61,19 @@ export const p2 = {
     request<ProjectV2>(`/api/projects/${id}/bindings`, { method: "POST", body: JSON.stringify(body) }),
   unbindMaterial: (id: string, body: { scene_id: string; kind: MaterialKind; material_id: string; base_version?: number }) =>
     request<ProjectV2>(`/api/projects/${id}/bindings`, { method: "DELETE", body: JSON.stringify(body) }),
-  addMaterials: (id: string, materials: { url: string; kind?: string; filename?: string; text?: string }[]) =>
+  addMaterials: (id: string, materials: { url: string; kind?: string; filename?: string; text?: string; duration?: number | null }[]) =>
     request<{ ok: boolean; materials: ProjectV2["materials"] }>(`/api/projects/${id}/materials`, { method: "POST", body: JSON.stringify({ materials }) }),
+  reorderMaterials: (id: string, order: string[], base_version: number) =>
+    request<ProjectV2>(`/api/projects/${id}/materials/reorder`, { method: "POST", body: JSON.stringify({ order, base_version }) }),
+  removeMaterial: (id: string, materialId: string, base_version?: number) =>
+    request<ProjectV2>(`/api/projects/${id}/materials/${materialId}${base_version != null ? `?base_version=${base_version}` : ""}`, { method: "DELETE" }),
+  resetContent: (id: string, base_version: number) =>
+    request<ProjectV2>(`/api/projects/${id}/reset`, { method: "POST", body: JSON.stringify({ base_version }) }),
 
   generate: (id: string, sceneId: string, body: { kind: "keyframe" | "voice" | "video"; prompt?: string; text?: string; force?: boolean; use_uploaded?: boolean; reference_scene_id?: string }) =>
     request<{ ok: boolean; job_id?: string; queued?: string; note?: string }>(`/api/projects/${id}/scenes/${sceneId}/generate`, { method: "POST", body: JSON.stringify(body) }),
 
-  startPipeline: (id: string, body: { script_text?: string; materials?: { url: string; kind?: string; filename?: string; text?: string }[]; settings?: Partial<ProjectSettings> }) =>
+  startPipeline: (id: string, body: { script_text?: string; materials?: { url: string; kind?: string; filename?: string; text?: string; duration?: number | null }[]; settings?: Partial<ProjectSettings> }) =>
     request<{ ok: boolean; run_id: string }>(`/api/projects/${id}/pipeline/start`, { method: "POST", body: JSON.stringify(body) }),
   advancePipeline: (id: string, confirmed = false) =>
     request<{ ok: boolean; run_id: string }>(`/api/projects/${id}/pipeline/advance`, { method: "POST", body: JSON.stringify({ confirmed }) }),
@@ -132,7 +138,7 @@ function normalizeAgentEvent(evt: RawAgentEvent): AgentV2Event {
 }
 
 export async function runAgentV2Stream(
-  body: { goal: string; project_id?: string | null; scene_id?: string | null; model?: string | null; credential_id?: string | null },
+  body: { goal: string; project_id?: string | null; scene_id?: string | null; model?: string | null; credential_id?: string | null; history?: { role: string; content: string }[] },
   onEvent: (e: AgentV2Event) => void,
 ): Promise<void> {
   const res = await fetch(`${API_BASE}/api/agent/run/stream`, {
@@ -175,10 +181,10 @@ export async function cancelAgentV2(runId: string): Promise<void> {
 
 // ---------------- 素材上传（复用 v1 上传端点，取得 URL 后随 pipeline start 提交） ----------------
 
-export async function uploadMaterial(file: File): Promise<{ url: string; kind: MaterialKind; filename: string; text?: string }> {
+export async function uploadMaterial(file: File): Promise<{ url: string; kind: MaterialKind; filename: string; text?: string; duration?: number | null }> {
   const kind = attachmentKind(file) ?? "doc";
   const att = await uploadAttachment(file, kind);
-  return { url: att.url, kind, filename: att.name, text: att.text };
+  return { url: att.url, kind, filename: att.name, text: att.text, duration: att.duration };
 }
 
 export type { PendingBinding, PipelineInfo, ProjectSummaryV2, ProjectV2, SceneV2 };

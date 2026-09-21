@@ -37,29 +37,65 @@ export default function StudioPage() {
     void ensureLoaded();
   }, [ensureLoaded]);
 
-  // 接收 Voice 页发来的旁白音频：登记为素材并绑定为当前分镜的参考音频
+  // 接收 Voice 页发来的旁白音频：先登记进素材池；已有分镜再绑定为当前分镜的参考音频
   const pendingVoice = useAppStore((s) => s.pendingVoice);
   const setPendingVoice = useAppStore((s) => s.setPendingVoice);
   useEffect(() => {
-    const url = pendingVoice;
-    if (!url || !project?.scenes.length) return;
+    const url = pendingVoice?.url;
+    // 项目未加载完先留着，加载完成后 project?.id 变化会重跑本 effect
+    if (!url || !project?.id) return;
     setPendingVoice(null);
-    const sceneId = useStudioV2Store.getState().currentSceneId ?? project.scenes[0].id;
+    const projectId = project.id;
     void (async () => {
       const { p2 } = await import("@/lib/api-v2");
-      const added = await p2.addMaterials(project.id, [{ url, kind: "audio" }]);
+      // 台词随素材入库：旧格式（uuid 命名）音频靠它合成语义文件名，分镜时才能对号
+      const added = await p2.addMaterials(projectId, [{ url, kind: "audio", text: pendingVoice.text || undefined }]);
       const material = (added.materials ?? []).find((m) => m.url === url);
       if (!material) {
         toast.error("旁白素材登记失败");
         return;
       }
-      const fresh = await p2.getProject(project.id);
-      await p2.bindMaterial(project.id, {
+      const fresh = await p2.getProject(projectId);
+      const current = useStudioV2Store.getState().currentSceneId;
+      const sceneId = fresh.scenes.some((s) => s.id === current)
+        ? current
+        : fresh.scenes[0]?.id;
+      if (!sceneId) {
+        toast.success("旁白已加入素材池（项目还没有分镜，生成分镜后在分镜抽屉绑定）");
+        return;
+      }
+      await p2.bindMaterial(projectId, {
         scene_id: sceneId, kind: "audio", material_id: material.id, base_version: fresh.version,
       });
       toast.success("旁白已绑定为该镜参考音频（生成时会随视频传入）");
-    })().catch((err) => toast.error(`旁白绑定失败：${(err as Error).message}`));
-  }, [pendingVoice, project?.id, project?.scenes.length, setPendingVoice]);
+    })().catch((err) => toast.error(`旁白发送失败：${(err as Error).message}`));
+  }, [pendingVoice, project?.id, setPendingVoice]);
+
+  // 接收图片页发来的生成图：登记进素材池即可，不自动绑镜——多图对号交给 bind 阶段 / 分镜抽屉
+  const pendingStudio = useAppStore((s) => s.pendingStudio);
+  const setPendingStudio = useAppStore((s) => s.setPendingStudio);
+  useEffect(() => {
+    const images = pendingStudio?.images ?? [];
+    // 项目未加载完先留着，加载完成后 project 变化会重跑本 effect
+    if (images.length === 0 || !project?.id) return;
+    setPendingStudio(null);
+    const projectId = project.id;
+    const inPool = new Set(project.materials.map((m) => m.url));
+    const fresh = images.filter((u) => !inPool.has(u));
+    if (fresh.length === 0) {
+      toast.success("这张图已在素材池中，无需重复发送");
+      return;
+    }
+    void (async () => {
+      const { p2 } = await import("@/lib/api-v2");
+      await p2.addMaterials(projectId, fresh.map((url) => ({ url, kind: "image" })));
+      toast.success(
+        project.scenes.length > 0
+          ? `已加入素材池（${fresh.length} 张）：可在分镜抽屉挂到指定镜头，或下次投放时自动分配`
+          : `已加入素材池（${fresh.length} 张）：启动流水线时会自动分配到分镜`,
+      );
+    })().catch((err) => toast.error(`图片发送失败：${(err as Error).message}`));
+  }, [pendingStudio, project, setPendingStudio]);
 
   useEffect(() => {
     void fetch(`${process.env.NEXT_PUBLIC_API_BASE || "http://127.0.0.1:8000"}/api/settings/catalog`)
@@ -221,10 +257,11 @@ export default function StudioPage() {
         </button>
       </div>
 
-      {/* 主体三栏：Agent 控制台 | 中央视图 | 单镜抽屉 */}
-      <div className="flex min-h-0 flex-1">
+      {/* 主体三栏：Agent 控制台 | 中央视图（整体一根滚动条） | 单镜抽屉（占位，看板自适应换行）。
+          极窄窗口下整行出横向滚动，保证任何卡片都可达 */}
+      <div className="flex min-h-0 flex-1 overflow-x-auto">
         <AgentConsole />
-        <div className="flex min-w-0 flex-1 flex-col gap-3 overflow-hidden p-4">
+        <div className="flex min-w-[420px] flex-1 flex-col gap-3 overflow-y-auto p-4">
           <IntakePanel />
           <PipelineBar />
           <ShotBoard />

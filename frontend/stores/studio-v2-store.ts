@@ -10,7 +10,7 @@
 import { create } from "zustand";
 import { toast } from "sonner";
 import { p2, subscribeProjectEvents, VersionConflictError } from "@/lib/api-v2";
-import type { ProjectSummaryV2, ProjectV2 } from "@/lib/types-v2";
+import type { MaterialKind, ProjectSummaryV2, ProjectV2 } from "@/lib/types-v2";
 
 interface StudioV2State {
   project: ProjectV2 | null;
@@ -36,13 +36,20 @@ interface StudioV2State {
   addScene: (index?: number) => Promise<void>;
   deleteScene: (sceneId: string) => Promise<void>;
   moveScene: (sceneId: string, dir: -1 | 1) => Promise<void>;
+  bindMaterial: (sceneId: string, kind: MaterialKind, materialId: string) => Promise<void>;
+  unbindMaterial: (sceneId: string, kind: MaterialKind, materialId: string) => Promise<void>;
+  /** 素材池同类内移位（图N↔图N±1），修正 storyboard 的 <Image N> 上传顺序对齐 */
+  moveMaterial: (materialId: string, dir: -1 | 1) => Promise<void>;
+  /** 删除单个素材：出池并解除全部分镜对它的绑定（绑定中的素材删除前先确认） */
+  removeMaterial: (materialId: string) => Promise<void>;
   patchSettings: (settings: Record<string, unknown>) => Promise<void>;
   renameProject: (name: string) => Promise<void>;
   setAspect: (aspect: string) => Promise<void>;
 
-  startPipeline: (scriptText: string, materials: { url: string; kind?: string; filename?: string; text?: string }[]) => Promise<void>;
+  startPipeline: (scriptText: string, materials: { url: string; kind?: string; filename?: string; text?: string; duration?: number | null }[]) => Promise<void>;
   advancePipeline: (confirmed: boolean) => Promise<void>;
   confirmBindings: () => Promise<void>;
+  resetContent: () => Promise<void>;
   generate: (sceneId: string, body: Parameters<typeof p2.generate>[2]) => Promise<void>;
   exportProject: () => Promise<void>;
 }
@@ -53,9 +60,10 @@ export const useStudioV2Store = create<StudioV2State>()((set, get) => {
   const applyServerProject = (fresh: ProjectV2) => {
     set((state) => {
       if (state.project && state.project.id === fresh.id && fresh.version < state.project.version) return state;
+      // 分镜没了（清空重投/切项目）就关抽屉；不自动选中第一镜——刷新/切项目时看板保持全宽
       const keepScene = fresh.scenes.some((s) => s.id === state.currentSceneId)
         ? state.currentSceneId
-        : fresh.scenes[0]?.id ?? null;
+        : null;
       return { project: fresh, currentSceneId: keepScene };
     });
   };
@@ -230,6 +238,76 @@ export const useStudioV2Store = create<StudioV2State>()((set, get) => {
       );
     },
 
+    bindMaterial: async (sceneId, kind, materialId) => {
+      await get().command(
+        (p) => p2.bindMaterial(p.id, { scene_id: sceneId, kind, material_id: materialId, base_version: p.version }),
+        (fresh) =>
+          fresh.scenes.some((s) => s.id === sceneId)
+            ? p2.bindMaterial(fresh.id, { scene_id: sceneId, kind, material_id: materialId, base_version: fresh.version })
+            : null,
+      );
+    },
+
+    unbindMaterial: async (sceneId, kind, materialId) => {
+      await get().command(
+        (p) => p2.unbindMaterial(p.id, { scene_id: sceneId, kind, material_id: materialId, base_version: p.version }),
+        (fresh) =>
+          fresh.scenes.some((s) => s.id === sceneId)
+            ? p2.unbindMaterial(fresh.id, { scene_id: sceneId, kind, material_id: materialId, base_version: fresh.version })
+            : null,
+      );
+    },
+
+    moveMaterial: async (materialId, dir) => {
+      const project = get().project;
+      if (!project) return;
+      const ids = project.materials.map((m) => m.id);
+      const i = ids.indexOf(materialId);
+      if (i < 0) return;
+      // 同类内移位：跳过中间其他类型的素材再交换——只改变同类之间的相对顺序，
+      // 音频穿插在图片中间时移动图片不会打乱音频的 <Audio N> 编号
+      const kind = project.materials[i].kind;
+      let j = i + dir;
+      while (j >= 0 && j < ids.length && project.materials[j].kind !== kind) j += dir;
+      if (j < 0 || j >= ids.length) return;
+      [ids[i], ids[j]] = [ids[j], ids[i]];
+      await get().command(
+        (p) => p2.reorderMaterials(p.id, ids, p.version),
+        (fresh) =>
+          fresh.materials.length === ids.length && ids.every((id) => fresh.materials.some((m) => m.id === id))
+            ? p2.reorderMaterials(fresh.id, ids, fresh.version)
+            : null,
+      );
+    },
+
+    removeMaterial: async (materialId) => {
+      const project = get().project;
+      const mat = project?.materials.find((m) => m.id === materialId);
+      if (!project || !mat) return;
+      const boundCount = project.scenes.filter(
+        (s) =>
+          s.binding.audios.includes(materialId) ||
+          s.binding.videos.includes(materialId) ||
+          s.binding.images.some((x) => x.material_id === materialId),
+      ).length;
+      if (
+        boundCount > 0 &&
+        !confirm(`「${mat.filename || materialId}」已绑到 ${boundCount} 个分镜，删除会同时解除这些绑定。确定删除？`)
+      ) {
+        return;
+      }
+      const r = await get().command(
+        (p) => p2.removeMaterial(p.id, materialId, p.version),
+        (fresh) =>
+          fresh.materials.some((m) => m.id === materialId)
+            ? p2.removeMaterial(fresh.id, materialId, fresh.version)
+            : null,
+      );
+      if (r) {
+        toast.success(`已删除素材「${mat.filename || materialId}」${boundCount > 0 ? `（解除 ${boundCount} 个分镜的绑定）` : ""}`);
+      }
+    },
+
     patchSettings: async (settings) => {
       await get().command(
         (p) => p2.patchProject(p.id, { base_version: p.version, settings }),
@@ -270,6 +348,17 @@ export const useStudioV2Store = create<StudioV2State>()((set, get) => {
 
     confirmBindings: async () => {
       await get().command((p) => p2.confirmBindings(p.id), null);
+    },
+
+    resetContent: async () => {
+      const r = await get().command(
+        (p) => p2.resetContent(p.id, p.version),
+        (fresh) => (fresh.materials.length === 0 ? Promise.resolve(fresh) : p2.resetContent(fresh.id, fresh.version)),
+      );
+      if (r) {
+        set({ currentSceneId: null });
+        toast.success("已清空：素材与分镜全部移除，可重新投放（项目名/画幅/模型设置保留）");
+      }
     },
 
     generate: async (sceneId, body) => {

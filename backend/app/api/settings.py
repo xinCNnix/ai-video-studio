@@ -140,7 +140,9 @@ async def discovered_models():
                     {"provider": cred["provider"], "name": cred["name"], "message": error}
                 )
             elif provider_voices:
-                existing = voices.setdefault(cred["provider"], [])
+                # 统一归到 minimax 组：minimax 凭据与指向 MiniMax 的 openai_compatible
+                # 凭据会发现同一份音色库，分组按凭据 provider 会整组重复
+                existing = voices.setdefault("minimax", [])
                 have = {v["id"] for v in existing}
                 existing.extend(v for v in provider_voices if v["id"] not in have)
         # 小米 MiMo：无音色查询接口，官方预置音色为静态列表，配了 Key 即全量下发；

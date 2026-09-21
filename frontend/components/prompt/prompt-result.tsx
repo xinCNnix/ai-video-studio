@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Check, Copy, FileText, Loader2, Pencil, RefreshCw, Save, Send, Wand2 } from "lucide-react";
+import { Check, Clapperboard, Copy, FileText, Loader2, Pencil, RefreshCw, Save, Send, Wand2 } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "@/lib/api";
 import type { PromptSection } from "@/lib/types";
@@ -25,6 +25,7 @@ export interface PromptResultProps {
   onRefine: (action: string) => void;
   onRegenerate: () => void;
   onSendToVideo: () => void;
+  onSendToStudio: () => void;
   onApplyRaw: (text: string) => void;
 }
 
@@ -130,6 +131,10 @@ export function PromptResult(props: PromptResultProps) {
           <Button size="sm" variant="accent" onClick={props.onSendToVideo} disabled={!props.raw}>
             <Send className="size-3.5" />
             Send to Video
+          </Button>
+          <Button size="sm" variant="outline" onClick={props.onSendToStudio} disabled={!props.raw}>
+            <Clapperboard className="size-3.5" />
+            Send to Studio
           </Button>
         </div>
       </div>

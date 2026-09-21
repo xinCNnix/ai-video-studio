@@ -7,7 +7,6 @@ import { toast } from "sonner";
 import { api, attachmentKind, uploadAttachment, type AgentLlmOption, type UploadedAttachment } from "@/lib/api";
 import { hydrateAgentChat, useAgentChatStore, type ChatArchive } from "@/lib/agent-chat-store";
 import { useAppStore } from "@/stores/app-store";
-import { useStudioV2Store } from "@/stores/studio-v2-store";
 import { Button } from "@/components/ui/button";
 import { SearchableSelect, type SearchableItem } from "@/components/common/searchable-select";
 import { cn } from "@/lib/utils";
@@ -15,8 +14,8 @@ import { cn } from "@/lib/utils";
 const SUGGESTIONS = [
   "把提示词改得更适合 H3",
   "这个剧本有什么问题？帮我看一下",
-  "把这个场景做成一条 5 秒视频：医生坐在诊室里向女孩解释白斑治疗误区",
-  "把下面剧本拆成 5 个分镜并逐个生成视频：女孩发现手背有白斑→去医院→医生解释误区→细胞科普动画→拥抱结尾",
+  "把下面台词润色一下，加停顿和语气标记",
+  "解释一下 I2V 和 T2V 的区别？",
 ];
 
 // 侧栏显式选择的模型（持久化；随每次 Agent 运行显式传给后端）
@@ -38,7 +37,9 @@ function loadPickedModel(): PickedModel | null {
 }
 
 /**
- * 全局 AI 助手侧栏：xl 以上推挤页面内容，小屏以浮层覆盖。
+ * 非 Studio 页的全局 AI 助手侧栏：问答/改 Prompt/台词加工等轻任务（无项目上下文）。
+ * Studio 页不渲染本组件——那边用页面自带的 Agent 控制台（v2 创作代理），两边互不串。
+ * xl 以上推挤页面内容，小屏以浮层覆盖。
  * 聊天记录持久化在 localStorage，刷新页面不清空，点「清空对话」才清除。
  */
 export function AgentSidebar() {
@@ -49,9 +50,6 @@ export function AgentSidebar() {
   const archives = useAgentChatStore((s) => s.archives);
   const archiveAndClear = useAgentChatStore((s) => s.archiveAndClear);
   const deleteArchive = useAgentChatStore((s) => s.deleteArchive);
-  const project = useStudioV2Store((s) => s.project);
-  const currentSceneId = useStudioV2Store((s) => s.currentSceneId);
-  const reloadProject = useStudioV2Store((s) => s.reloadProject);
 
   const [input, setInput] = useState("");
   // busy 同步进全局 store：图片页据此开启历史轮询
@@ -72,8 +70,10 @@ export function AgentSidebar() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [attachments, setAttachments] = useState<UploadedAttachment[]>([]);
   const [uploading, setUploading] = useState(false);
+  // 当前运行的 run_id（SSE started 事件下发）：停止时精确取消本 run，
+  // 不走后端空 run_id 的"取消全部"——那会误杀 Studio 里正在跑的 agent
+  const activeRunIdRef = useRef<string | null>(null);
 
-  const scene = project?.scenes.find((s) => s.id === currentSceneId) ?? null;
   const isStudio = pathname.startsWith("/studio");
 
   useEffect(() => {
@@ -152,20 +152,15 @@ export function AgentSidebar() {
     addMessage({ role: "user", content: display ?? goal });
     setBusy(true);
     setLiveSteps([]);
+    activeRunIdRef.current = null;
     try {
       // 流式执行：每个工具步骤实时上屏，不再等整个长请求结束才看到进展
+      // 不带 project_id：侧栏助手与 Studio 项目彻底隔离，不会碰分镜/流水线
       const res = await api.runAgentStream(
         {
           goal,
           history,
           page: pathname,
-          scene_title: scene?.title ?? "",
-          scene_description: scene?.description ?? "",
-          scene_prompt: scene?.prompt ?? "",
-          scene_narration: scene?.narration ?? "",
-          scene_image: scene?.assets.keyframe ?? null,
-          aspect_ratio: project?.aspect_ratio ?? "16:9",
-          project_id: project?.id ?? null,
           // 侧栏显式选择的模型：随请求传给后端，覆盖设置里的默认文本模型
           ...(picked ? { model: picked.model, credential_id: picked.credential_id } : {}),
         },
@@ -173,12 +168,11 @@ export function AgentSidebar() {
           if (step.type === "tool") {
             setLiveSteps((prev) => [...prev, `▸ ${step.tool}：${ok(step.result)}`]);
           }
+        },
+        (runId) => {
+          activeRunIdRef.current = runId;
         }
       );
-      // 分镜被改写：从后端重新加载项目（结果也会经 SSE 推送）
-      if (res.project_changed) {
-        await reloadProject();
-      }
       const stepsText = (res.steps ?? [])
         .filter((s) => s.type === "tool")
         .map((s) => `▸ ${s.tool}：${ok(s.result)}`)
@@ -190,6 +184,7 @@ export function AgentSidebar() {
     } finally {
       setBusy(false);
       setLiveSteps([]);
+      activeRunIdRef.current = null;
     }
   };
 
@@ -197,7 +192,7 @@ export function AgentSidebar() {
     if (!busy) return;
     setStopping(true);
     try {
-      await api.cancelAgent();
+      await api.cancelAgent(activeRunIdRef.current ?? undefined);
       toast.info("已请求停止：Agent 将在当前步骤后中止（已提交的后台任务不受影响）");
     } catch {
       toast.error("停止请求失败，请重试");
@@ -268,7 +263,8 @@ export function AgentSidebar() {
     void runTask(goal, history, display);
   };
 
-  if (!open) return null;
+  // Studio 有自己的 Agent 控制台（v2 创作代理），本侧栏不进 Studio，防止双 agent 串台
+  if (isStudio || !open) return null;
 
   return (
     <aside
@@ -299,9 +295,7 @@ export function AgentSidebar() {
           />
         </div>
         <div className="mt-0.5 flex items-center justify-between text-[11px] text-muted-foreground">
-          <span className="truncate">
-            {`提问、改文案、生成图片/配音/视频都可以，直接说需求${isStudio && scene ? ` · Scene ${scene.title}` : ""}`}
-          </span>
+          <span className="truncate">{`提问、改文案、润色台词都可以，直接说需求`}</span>
           <span className="flex shrink-0 items-center gap-2">
             {archives.length > 0 && (
               <button
@@ -344,7 +338,7 @@ export function AgentSidebar() {
             {messages.length === 0 && (
               <div className="space-y-2">
                 <p className="text-xs leading-relaxed text-muted-foreground">
-                  {"我是你的创作助手：提问、改 Prompt、拆分镜、生成配音/图片/视频都行。试试："}
+                  {"我是你的创作助手：提问、改 Prompt、润色台词文案都行（分镜与生成请在 Studio 的 Agent 控制台操作）。试试："}
                 </p>
                 <div className="flex flex-wrap gap-1.5">
                   {SUGGESTIONS.map((s) => (

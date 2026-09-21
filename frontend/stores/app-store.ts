@@ -10,6 +10,12 @@ export interface PendingVideo {
   images?: string[];
 }
 
+/** 独立工具页 → Studio 的手动交接：图片页的生成图入素材池；提示词页的 Prompt 文本并入投放剧本框 */
+export interface PendingStudio {
+  images?: string[];
+  text?: string;
+}
+
 interface AppState {
   catalog: ModelCatalog | null;
   credentials: Credential[];
@@ -24,7 +30,9 @@ interface AppState {
   /** Agent 任务执行中（跨页面共享，图片页据此开启历史轮询） */
   agentBusy: boolean;
   pendingVideo: PendingVideo | null;
-  pendingVoice: string | null;
+  /** Voice 页发往 Studio 的旁白：台词随行，素材按台词命名才能在分镜时对号 */
+  pendingVoice: { url: string; text: string } | null;
+  pendingStudio: PendingStudio | null;
 
   loadCatalog: () => Promise<void>;
   loadCredentials: () => Promise<void>;
@@ -33,7 +41,8 @@ interface AppState {
   setAgentOpen: (open: boolean) => void;
   setAgentBusy: (busy: boolean) => void;
   setPendingVideo: (v: PendingVideo | null) => void;
-  setPendingVoice: (url: string | null) => void;
+  setPendingVoice: (v: { url: string; text: string } | null) => void;
+  setPendingStudio: (v: PendingStudio | null) => void;
 }
 
 export const useAppStore = create<AppState>()((set, get) => ({
@@ -48,6 +57,7 @@ export const useAppStore = create<AppState>()((set, get) => ({
   agentBusy: false,
   pendingVideo: null,
   pendingVoice: null,
+  pendingStudio: null,
 
   loadCatalog: async () => {
     try {
@@ -84,11 +94,15 @@ export const useAppStore = create<AppState>()((set, get) => ({
         if (p.capabilities.includes("llm")) llm = mergeModels(llm, p.id);
         if (p.capabilities.includes("image")) image = mergeModels(image, p.id);
       }
+      // 同一音色可能被多个凭据发现（如 minimax Key + 指向 MiniMax 的 openai_compatible Key），
+      // 合并时按 id 去重，否则下拉列表出现重复项触发 React key 冲突
       const seenVoices = new Set(cat.tts_voices.map((v) => v.id));
-      const extraVoices = Object.values(voices)
-        .flat()
-        .filter((v) => !seenVoices.has(v.id))
-        .map((v) => ({ id: v.id, label: v.label }));
+      const extraVoices: { id: string; label: string }[] = [];
+      for (const v of Object.values(voices).flat()) {
+        if (seenVoices.has(v.id)) continue;
+        seenVoices.add(v.id);
+        extraVoices.push({ id: v.id, label: v.label });
+      }
       // 发现的 TTS 模型（如 MiniMax mimo-tts 系列）合并进语音模型选择器
       const seenTts = new Set(cat.tts.map((m) => `${m.provider}:${m.id}`));
       const extraTtsModels = Object.entries(discovered_tts ?? {}).flatMap(([provider, ids]) =>
@@ -121,6 +135,7 @@ export const useAppStore = create<AppState>()((set, get) => ({
   setAgentBusy: (busy) => set({ agentBusy: busy }),
   setPendingVideo: (v) => set({ pendingVideo: v }),
   setPendingVoice: (url) => set({ pendingVoice: url }),
+  setPendingStudio: (v) => set({ pendingStudio: v }),
 }));
 
 type ModelInfoList = ModelCatalog["llm"];

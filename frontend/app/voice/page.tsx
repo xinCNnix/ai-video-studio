@@ -2,7 +2,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
-import { AudioLines, Download, Trash2 } from "lucide-react";
+import { AudioLines, Download, Send, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 import { api, fileUrl, pollJob, API_BASE } from "@/lib/api";
 import { loadModelPref, pushRecent, saveModelPref } from "@/lib/model-prefs";
@@ -13,7 +13,7 @@ import { AudioPlayer } from "@/components/voice/audio-player";
 import { EmptyState } from "@/components/common/empty-state";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
-import { cn, fmtDate } from "@/lib/utils";
+import { cn, fmtDate, fmtSeconds } from "@/lib/utils";
 
 export default function VoicePage() {
   const router = useRouter();
@@ -91,10 +91,18 @@ export default function VoicePage() {
   };
 
   const isDesignJob = !!currentJob && String(currentJob.model).includes("voicedesign");
+  // 最新产物精确时长（ffprobe 实测）：播放器自带的 mm:ss 是取整值且需加载元数据后才出现
+  const latestSeconds = fmtSeconds(currentJob?.duration_seconds);
 
   // 克隆音色上传固化成功：刷新列表并直接选中新音色
   const onCloneCreated = async (asset: VoiceAsset) => {
     commitVoice(asset.id);
+    await loadAssets();
+    void loadDiscovered();
+  };
+
+  // MiniMax 永久音色设计成功：只刷新列表，不抢占 Voice 描述输入（可继续调整重新设计）
+  const onDesignCreated = async (_asset: VoiceAsset) => {
     await loadAssets();
     void loadDiscovered();
   };
@@ -142,11 +150,20 @@ export default function VoicePage() {
       toast.error("请选择或输入语音模型 ID（可在设置里保存为自定义模型）");
       return;
     }
-    // 声音克隆：必须选中带样本的克隆音色（即用户上传固化的声音）
-    if (voiceModeOf(modelId) === "clone") {
+    const isHiggs = modelId.toLowerCase().includes("higgs");
+    // 声音克隆（非 higgs）：必须选中带样本的克隆音色（即用户上传固化的声音）
+    if (!isHiggs && voiceModeOf(modelId) === "clone") {
       const asset = assets.find((a) => a.id === voice);
       if (!asset || !asset.has_sample) {
         toast.error("声音克隆需要先上传声音样本：保存为克隆音色并选中后，再用它生成语音");
+        return;
+      }
+    }
+    // Higgs：音色命中资产时走克隆（样本+逐字稿），缺逐字稿会在推理时报错，提前拦下
+    if (isHiggs) {
+      const asset = assets.find((a) => a.id === voice);
+      if (asset && !(asset.ref_text || "").trim()) {
+        toast.error("该音色缺少样本逐字稿（Higgs 克隆必填）：请删除后重新上传，并填写样本念的文字");
         return;
       }
     }
@@ -160,7 +177,8 @@ export default function VoicePage() {
         provider,
         model: modelId,
         text,
-        voice,
+        // Higgs 音色留空 = 零样本内置音色；其余模型必须显式音色
+        voice: isHiggs && !voice.trim() ? "default" : voice,
         speed,
         emotion,
       });
@@ -199,6 +217,7 @@ export default function VoicePage() {
         onDeleteAsset={(a) => void deleteAsset(a)}
         onUseAsset={(a) => commitVoice(a.id)}
         onCloneCreated={(a) => void onCloneCreated(a)}
+        onDesignCreated={(a) => void onDesignCreated(a)}
       />
 
       {/* 中央：文案编辑 + 大型播放器，整体居中 */}
@@ -218,9 +237,9 @@ export default function VoicePage() {
             <>
               <AudioPlayer
                 src={currentJob.output}
-                title="Latest generation"
+                title={`Latest generation${latestSeconds ? ` · ${latestSeconds}` : ""}`}
                 onSendToStudio={() => {
-                  setPendingVoice(currentJob.output);
+                  setPendingVoice({ url: currentJob.output ?? "", text: String(currentJob.params?.text ?? "") });
                   router.push("/studio");
                 }}
               />
@@ -255,7 +274,9 @@ export default function VoicePage() {
           {history.length > 0 && (
             <div className="space-y-2">
               <h3 className="text-xs font-medium text-muted-foreground">Recent Generations</h3>
-              <div className="grid max-h-72 gap-2 overflow-y-auto pr-1">
+              {/* flex 而非 grid：grid 自动列会取最宽行的整行内容宽（长文案不换行），
+                  把日期/图标挤出视口；flex-col + 行内 min-w-0 才能让文案截断、图标常驻可见 */}
+              <div className="flex max-h-72 flex-col gap-2 overflow-y-auto pr-1">
                 {history.map((job) => (
                   <div
                     key={job.id}
@@ -273,6 +294,14 @@ export default function VoicePage() {
                     >
                       <span className="flex min-w-0 items-center gap-1.5">
                         <span className="truncate">{String(job.params?.text ?? "")}</span>
+                        {job.duration_seconds ? (
+                          <span
+                            className="shrink-0 font-semibold tabular-nums text-amber-300"
+                            title="该条配音的精确时长（ffprobe 实测）"
+                          >
+                            {fmtSeconds(job.duration_seconds)}
+                          </span>
+                        ) : null}
                         {job.params?.credential ? (
                           <span
                             className="shrink-0 text-[10px] text-emerald-300/70"
@@ -296,6 +325,20 @@ export default function VoicePage() {
                       >
                         <Download className="size-3.5" />
                       </a>
+                    )}
+                    {job.output && (
+                      <button
+                        type="button"
+                        title="发送到 Studio 作为场景旁白"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPendingVoice({ url: job.output ?? "", text: String(job.params?.text ?? "") });
+                          router.push("/studio");
+                        }}
+                        className="ml-1 flex size-6 shrink-0 cursor-pointer items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-primary/10 hover:text-primary"
+                      >
+                        <Send className="size-3.5" />
+                      </button>
                     )}
                     <button
                       type="button"

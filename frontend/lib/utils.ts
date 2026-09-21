@@ -14,6 +14,12 @@ export function fmtTime(seconds: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+/** 音频精确时长（后端 ffprobe 实测，保留实际精度不补零）；无效/缺失返回 null，调用方按需隐藏。 */
+export function fmtSeconds(seconds?: number | null): string | null {
+  if (seconds == null || !isFinite(seconds) || seconds <= 0) return null;
+  return `${Number(seconds.toFixed(2))}s`;
+}
+
 export function fmtDate(iso?: string): string {
   if (!iso) return "";
   try {

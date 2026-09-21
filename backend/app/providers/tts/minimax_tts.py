@@ -5,6 +5,9 @@
 - POST /v1/voice_clone 用 file_id 换取自定义 voice_id
 克隆出的 voice_id 与系统音色同构，直接放进 t2a_v2 的 voice_setting.voice_id，
 且 speed/emotion 结构化字段对克隆音色同样生效。
+
+音色设计走 POST /v1/voice_design：文字描述直接生成永久 voice_id（文生音色），
+与系统/克隆音色同构，同入 t2a_v2 合成。
 """
 import asyncio
 import mimetypes
@@ -94,6 +97,56 @@ class MiniMaxTTS(TTSProvider):
                     continue
                 raise err
         raise last_model_err or ProviderError("克隆失败：所有候选模型均被拒绝。")
+
+    async def design_voice(self, prompt: str, preview_text: str, voice_id: str | None = None) -> tuple[str, bytes]:
+        """文字描述设计音色，返回 (永久 voice_id, 试听 mp3 字节)。
+
+        prompt 为自然语言音色描述；preview_text 为试听文本（接口上限 500 字符，
+        试听合成按字符计费），超出部分截断后发送。voice_id 缺省由服务端生成；
+        产出的文生音色与系统/克隆音色同构，直接用于 t2a_v2 的 voice_setting.voice_id。
+        """
+        body: dict = {"prompt": prompt, "preview_text": preview_text[:500]}
+        if voice_id:
+            body["voice_id"] = voice_id
+        params = {"GroupId": self.group_id} if self.group_id else None
+        last_err: Exception | None = None
+        for attempt, delay in enumerate((0, *_RETRY_DELAYS)):
+            if delay:
+                await asyncio.sleep(delay)
+            try:
+                async with httpx.AsyncClient(timeout=120) as client:
+                    resp = await client.post(
+                        f"{self.base_url}/v1/voice_design",
+                        json=body,
+                        params=params,
+                        headers={"Authorization": f"Bearer {self.api_key}"},
+                    )
+            except httpx.HTTPError as exc:
+                last_err = ProviderError(f"音色设计请求失败（第 {attempt + 1} 次）：{exc}")
+                continue  # 网络类错误一律可重试
+            if resp.status_code in (429, 500, 502, 503, 504):
+                last_err = ProviderError(f"音色设计返回 {resp.status_code}（第 {attempt + 1} 次）：{resp.text[:200]}")
+                continue  # 限流/服务端瞬时错误可重试
+            if resp.status_code >= 400:
+                raise ProviderError(f"音色设计返回 {resp.status_code}：{resp.text[:300]}")
+            data = resp.json()
+            base_resp = data.get("base_resp") or {}
+            status = base_resp.get("status_code", 0)
+            if status != 0:
+                msg = str(base_resp.get("status_msg", "未知错误"))
+                if status in (1002, 1039) or "rate limit" in msg.lower():
+                    last_err = ProviderError(f"音色设计错误（第 {attempt + 1} 次）：{msg}")
+                    continue
+                raise ProviderError(f"音色设计错误：{msg}")
+            new_voice_id = data.get("voice_id")
+            audio_hex = data.get("trial_audio")
+            if not new_voice_id or not audio_hex:
+                raise ProviderError("音色设计未返回 voice_id 或试听音频。")
+            try:
+                return new_voice_id, bytes.fromhex(audio_hex)
+            except ValueError as exc:
+                raise ProviderError("音色设计试听音频解码失败。") from exc
+        raise last_err or ProviderError("音色设计多次重试后仍失败。")
 
     async def synthesize(
         self,

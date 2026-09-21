@@ -17,6 +17,7 @@ export default function PromptPage() {
   const loadCatalog = useAppStore((s) => s.loadCatalog);
   const loadCredentials = useAppStore((s) => s.loadCredentials);
   const setPendingVideo = useAppStore((s) => s.setPendingVideo);
+  const setPendingStudio = useAppStore((s) => s.setPendingStudio);
 
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState("text_to_video");
@@ -102,6 +103,12 @@ export default function PromptPage() {
     router.push("/video");
   };
 
+  // 提示词发到 Studio 的投放剧本框：多次发送会追加，由 Studio 流水线拆分镜
+  const sendToStudio = () => {
+    setPendingStudio({ text: raw });
+    router.push("/studio");
+  };
+
   return (
     <div className="flex h-[calc(100vh-3.5rem)] overflow-hidden">
       <PromptEditor
@@ -124,6 +131,7 @@ export default function PromptPage() {
         onRefine={(action) => void refine(action)}
         onRegenerate={() => void refine("regenerate")}
         onSendToVideo={sendToVideo}
+        onSendToStudio={sendToStudio}
         onApplyRaw={(text) => {
           setRaw(text);
           setSections(parsePromptSections(text));

@@ -55,7 +55,8 @@ async def run_voice_job(job_id: str, provider: str, model: str, credential_id: s
             jm.update(job_id, note=f"分段合成 {i + 1}/{total}")
         audio += await tts.synthesize(text=chunk, model=model, voice=voice, speed=speed, emotion=emotion)
     jm.update(job_id, status="downloading")
-    url = await file_service.save_output("audio", audio)
+    # 台词写入文件名：下游（素材清单/分镜 bind/编号互证）按文件名提台词对号
+    url = await file_service.save_output("audio", audio, name_hint=text)
     local = file_service.resolve_local(url)
     exact_seconds = None
     if local and local.exists():

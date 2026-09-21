@@ -11,10 +11,17 @@ import re
 
 from ..config import model_store, settings, voice_assets
 from ..config.key_manager import list_keys
-from ..harness.state import Material, Project, Scene, clamp_duration, find_video_model
+from ..harness.state import (
+    MAX_SCENE_DURATION,
+    Material,
+    Project,
+    Scene,
+    clamp_duration,
+    find_video_model,
+)
 from ..jobs import job_manager
 from ..jobs.manager import ACTIVE_STATUSES
-from . import file_service, image_service, material_match, video_service, voice_service
+from . import file_service, image_service, material_match, prompt_timing, video_service, voice_service
 from . import project_store
 
 VIDEO_POLL_MAX = 25 * 60  # 写回侧轮询上限（生成侧 20min + 下载余量）
@@ -54,8 +61,11 @@ def _has_xiaomi_key() -> bool:
 
 
 def tts_provider_for_model(model: str) -> str:
-    """按模型 ID 判定 TTS 协议厂商：mimo-* 走小米，其余走 MiniMax/通用协议。"""
-    return "xiaomi" if model.strip().lower().startswith("mimo-") else "minimax"
+    """按模型 ID 判定 TTS 协议厂商：higgs 走本地，mimo-* 走小米，其余走 MiniMax/通用协议。"""
+    m = model.strip().lower()
+    if "higgs" in m:
+        return "higgs"
+    return "xiaomi" if m.startswith("mimo-") else "minimax"
 
 
 def default_tts_setup() -> tuple[str, str, str]:
@@ -101,7 +111,7 @@ def calibrate_duration(audio_seconds: float, old: int, model_id: str | None) -> 
     new_dur = clamp_duration(int(audio_seconds + 0.999), model_id)
     note = None
     if abs(new_dur - old) >= 1:
-        note = f"该镜时长已从 {old}s 校准为 {new_dur}s（旁白实际 {audio_seconds:.1f}s）——Prompt 的 Action Timeline 需同步重排为 0-{new_dur}s"
+        note = f"该镜时长已从 {old}s 校准为 {new_dur}s（旁白实际 {audio_seconds:.1f}s）——Prompt 时间轴已同步缩放为 0-{new_dur}s"
     model = find_video_model(model_id)
     if model and model.get("durations") and new_dur >= max(model["durations"]):
         note = ((note + "；") if note else "") + (
@@ -109,6 +119,34 @@ def calibrate_duration(audio_seconds: float, old: int, model_id: str | None) -> 
             "建议拆成两镜或精简台词"
         )
     return new_dur, note
+
+
+AUDIO_FIT_TOL = 0.5  # 台词总时长与镜头时长的容忍差（秒）
+
+
+def fit_duration_to_audios(total_seconds: float, old: int, model_id: str | None) -> tuple[int | None, str | None, str | None]:
+    """按绑定台词音频总时长校准分镜时长（bind 落盘/视频提交双闸门的唯一实现）。
+
+    视频模型放不下台词时会把台词压缩变形后烧进音轨（复现事故：7.96s 台词配 7s 镜头，
+    第二句语速/停顿全变）。装得下→自动加长并说明；模型上限仍装不下→返回阻断错误，
+    绝不按原时长提交。返回 (新时长, 校准说明, 阻断错误)。
+    """
+    if total_seconds <= old + AUDIO_FIT_TOL:
+        return old, None, None
+    new_dur = clamp_duration(int(total_seconds + 0.999), model_id)
+    if total_seconds > new_dur + AUDIO_FIT_TOL:
+        model = find_video_model(model_id)
+        top = max(model["durations"]) if model and model.get("durations") else MAX_SCENE_DURATION
+        return None, None, (
+            f"该镜绑定台词音频共 {total_seconds:.1f}s，超过视频模型最长 {top}s——"
+            "请拆成两镜或精简台词后再生成"
+        )
+    note = (
+        f"该镜时长已从 {old}s 校准为 {new_dur}s（绑定台词音频共 {total_seconds:.1f}s，"
+        "剧本看不到配音精确时长由系统兜底）——Prompt 时间轴（含原文块时长引用）"
+        f"已同步缩放为 0-{new_dur}s"
+    )
+    return new_dur, note, None
 
 
 # ---------------- 素材解析与请求组装 ----------------
@@ -142,12 +180,14 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
     组装规则（历史事故修复的唯一实现）：
     - i2v+参考混传：官方 V2 禁止，关键帧并入参考图走 reference 模式
     - 音频同台词去重、按台词位置排序、<Audio N> 按实际传入重编号
-    - 参考图/视频按 <Picture/Video N> 声明顺序对齐
+    - 参考图/视频按绑定顺序原样传入（bind 已把 Prompt 声明行重写成绑定顺序＝
+     上传顺序对齐；此前按文件名语义重排，"小墨"撞进"吕满春+小墨双人"声明行，
+     小墨图与双人图互换槽位——角色参考张冠李戴）
     - AutoDL 工作流契约提交前拦截
     """
     urls = scene_material_urls(scene, materials)
-    ref_images = material_match.sort_ref_assets_by_prompt(urls["ref_images"], scene.prompt, "Picture")
-    ref_videos = material_match.sort_ref_assets_by_prompt(urls["ref_videos"], scene.prompt, "Video")
+    ref_images = urls["ref_images"]
+    ref_videos = urls["ref_videos"]
     all_audios = urls["ref_audios"]
     unique_audios, dupe_audios = material_match.dedupe_same_text_audios(all_audios)
     notes: list[str] = []
@@ -157,6 +197,24 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
     if len(ref_audios) > 3:
         ref_audios, dropped = material_match.pick_matching_audios(unique_audios, scene.prompt, scene.narration, limit=3)
         notes.append(f"该镜挂有 {len(all_audios)} 段音频超出上限 3 段，已按旁白文案自动挑选 {len(ref_audios)} 段传入")
+    # TTS 配音镜：旁白音频不在绑定里而在 assets.voice（reconcile 先配音后视频）。H3 契约
+    # 要求台词必须引用真实传入的音频——配音作为 <Audio 1> 传入，否则悬空标签被闸门拦截，
+    # 模型也会凭 Audio Timeline 的台词引号自行编造语音。已绑用户音频时以绑定的为准
+    # （导出侧 assets.voice 整轨替换音轨，不会与模型烧录的同一句叠放）
+    if scene.assets.voice and not ref_audios:
+        ref_audios = [scene.assets.voice]
+
+    # 台词时长防线（纯函数）：已知时长的绑定音频总时长超过镜头时长即拦截。
+    # ensure_scene_audio_fit 已探测+校准，这里兜探测失败/时长缺失仍可知的漏网
+    dur_by_url = {m.url: m.duration for m in materials.values() if m.url}
+    known_durations = [dur_by_url[u] for u in ref_audios if dur_by_url.get(u)]
+    audio_total = sum(known_durations)
+    audio_fit_error = ""
+    if audio_total > scene.duration + AUDIO_FIT_TOL:
+        audio_fit_error = (
+            f"该镜绑定台词音频共 {audio_total:.1f}s，超过镜头时长 {scene.duration}s——"
+            "视频模型放不下会把台词压缩变形，请加长该镜时长或拆成两镜"
+        )
 
     keyframe = urls["first_frame"]
     has_refs = bool(ref_images or ref_videos or ref_audios)
@@ -200,7 +258,7 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
                     f"{'图' if label == 'Picture' else '视频'}：悬空标签会让模型找不到指定素材"
                 )
                 break
-    contract_error = tag_error or video_service.autodl_contract_error(
+    contract_error = tag_error or audio_fit_error or video_service.autodl_contract_error(
         vmodel["id"], mode, images, ref_videos, ref_audios, prompt=prompt
     )
     return {
@@ -213,7 +271,7 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
 # ---------------- 写回辅助 ----------------
 
 
-def writeback_completed_video(project_id: str, scene_id: str, output: str, fingerprint: str = "") -> str | None:
+def writeback_completed_video(project_id: str, scene_id: str, output: str, fingerprint: str = "", job_id: str | None = None) -> str | None:
     """把已完成的视频产物写回 v2 分镜（重启恢复路径复用；指纹校验）。
 
     返回 None = 成功；字符串 = 未写回原因。
@@ -222,9 +280,12 @@ def writeback_completed_video(project_id: str, scene_id: str, output: str, finge
         project = project_store.get(project_id)
         if not project:
             return f"项目 {project_id} 不存在，无法写回"
-        scene = next((s for s in project.scenes if s.id == scene_id), None)
+        scene = next((s for s in project.get("scenes") or [] if s.get("id") == scene_id), None)
         if not scene:
             return f"分镜 {scene_id} 已不存在，无法写回"
+        current_job = (scene.get("assets") or {}).get("video_job")
+        if job_id and current_job and current_job != job_id:
+            return f"分镜 {scene_id} 已由新任务接管（当前 job {current_job}），产物未写回"
         current_fp = prompt_fingerprint(scene.get("prompt") or "")
         if fingerprint and current_fp != fingerprint:
             return f"分镜 {scene_id} 的 Prompt 在生成期间已被改写（提交指纹 {fingerprint}，当前 {current_fp}），产物未写回"
@@ -365,9 +426,10 @@ async def generate_voice(project_id: str, scene_id: str, *, text_override: str |
                 "ok": True, "scene_id": scene_id, "voice": audio_url, "audio_seconds": audio_seconds,
                 "note": "已采用绑定的上传音频作为该镜旁白（未调用 TTS），时长保持设定值；该音频仍会随视频生成传入",
             }
-            if audio_seconds and scene.duration and audio_seconds > scene.duration + 0.5:
+            if audio_seconds and scene.duration and audio_seconds > scene.duration + AUDIO_FIT_TOL:
                 result["warning"] = (
-                    f"音频实际 {audio_seconds:.1f}s 长于该镜设定 {scene.duration}s，成片拼接时会被截断——是否加长该镜由用户决定"
+                    f"音频实际 {audio_seconds:.1f}s 长于该镜设定 {scene.duration}s；视频生成前会按该镜"
+                    "绑定台词总时长自动校准镜头时长"
                 )
             if trace:
                 trace.log("tool_result", tool="generate_voice", ok=True, mode="use_uploaded")
@@ -396,7 +458,7 @@ async def generate_voice(project_id: str, scene_id: str, *, text_override: str |
         return {"ok": False, "error": "未配置语音模型：请先在项目设置选择语音模型，或在设置页配置 TTS"}
     provider = tts_provider_for_model(model)
     voice = voice or (project.settings.voice_id if (project.settings.voice_id and provider == d_provider) else None) \
-        or (d_voice if provider == d_provider else ("冰糖" if provider == "xiaomi" else "female-shaonv"))
+        or (d_voice if provider == d_provider else ("default" if provider == "higgs" else ("冰糖" if provider == "xiaomi" else "female-shaonv")))
     if trace:
         trace.log("tool_call", tool="generate_voice", scene_id=scene_id, model=model, voice=voice)
     job = job_manager.create("tts", provider, model, {
@@ -438,7 +500,10 @@ def _set_voice(p: Project, scene_id: str, url: str, duration: int | None = None)
     s = _find_scene(p, scene_id)
     if s:
         s.assets.voice = url
-        if duration is not None:
+        if duration is not None and duration != s.duration:
+            if s.prompt:  # 配音实测时长校准镜长：Prompt 时间引用同步缩放，不留自相矛盾指令
+                s.prompt, _ = prompt_timing.rescale_prompt_timing(s.prompt, s.duration, duration)
+                s.revision += 1
             s.duration = duration
         if s.status in ("generating", "failed"):
             s.status = "ready" if not s.assets.video else "done"
@@ -468,7 +533,57 @@ def _mark(p: Project, scene_id: str, *, status: str | None = None, error: str | 
 # ---------------- 视频生成 ----------------
 
 
-def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int | None = None, trace=None) -> dict:
+async def ensure_scene_audio_fit(project: Project, scene: Scene, project_id: str) -> tuple[str | None, str | None]:
+    """视频提交前的台词时长兜底：绑定音频缺时长的先探测，总时长超镜头则自动校准。
+
+    返回 (校准说明, 阻断错误)。探测失败（时长未知）的音频不计入总和——
+    assemble_video_request 里还有一道按已知时长的确定性防线。
+    """
+    materials = {m.id: m for m in project.materials}
+    bound = [materials[mid] for mid in scene.binding.audios if mid in materials]
+    if not bound:
+        return None, None
+    to_probe = [m for m in bound if m.duration is None and m.url]
+    if to_probe:
+        probed: dict[str, float] = {}
+        for m in to_probe:
+            sec = await voice_service.probe_audio_seconds(m.url)
+            if sec:
+                probed[m.id] = sec
+        if probed:
+            def _set_dur(p: Project) -> None:
+                mats = {x.id: x for x in p.materials}
+                for mid, sec in probed.items():
+                    if mid in mats:
+                        mats[mid].duration = sec
+            project_store.mutate(project_id, _set_dur)
+            for m in bound:  # 本地副本同步，供下面求和
+                if m.id in probed:
+                    m.duration = probed[m.id]
+    total = sum(m.duration for m in bound if m.duration)
+    if not total:
+        return None, None
+    new_dur, note, error = fit_duration_to_audios(total, scene.duration, project.settings.video_model)
+    if error:
+        return None, error
+    if note:
+        if scene.prompt:  # 校准必须同步 Prompt 时间引用（含原文块），否则残留旧时长与 duration 参数自相矛盾
+            scene.prompt, _ = prompt_timing.rescale_prompt_timing(scene.prompt, scene.duration, new_dur)
+            scene.revision += 1
+        scene.duration = new_dur
+
+        def _apply_fit(p: Project) -> None:
+            s = _find_scene(p, scene.id)
+            if s:
+                s.duration = new_dur
+                s.prompt = scene.prompt
+                s.revision += 1
+
+        project_store.mutate(project_id, _apply_fit)
+    return note, None
+
+
+async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int | None = None, trace=None, force: bool = False) -> dict:
     """提交一镜视频生成（非阻塞）。Prompt 从项目分镜原样读取，用户内容不经过
     任何模型输出通道；唯一确定性改写是 <Audio N> 重编号。"""
     project_dict = project_store.get(project_id)
@@ -482,26 +597,63 @@ def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int |
         return {"ok": False, "error": f"分镜「{scene.title}」没有 Prompt，无法生成视频"}
     if job_active(scene.assets.video_job):
         return {"ok": False, "error": "该分镜已有进行中的视频任务", "job_id": scene.assets.video_job}
-    if scene.assets.video:
-        return {"ok": False, "error": "该分镜已有视频，重新生成请先清除", "video": scene.assets.video}
+    if scene.assets.video and not force:
+        return {"ok": False, "error": "该分镜已有视频，重新生成需 force 覆盖", "video": scene.assets.video}
+
+    # 台词时长闸门：绑定音频总时长放不下时模型会把台词压缩变形，先校准/拦截
+    fit_note, fit_error = await ensure_scene_audio_fit(project, scene, project_id)
+    if fit_error:
+        if trace:
+            trace.log("tool_result", tool="submit_video", ok=False, scene_id=scene_id, error=fit_error)
+        return {"ok": False, "error": fit_error}
 
     vmodel = resolve_video_model(project.settings.video_model)
     materials = {m.id: m for m in project.materials}
+
+    # 显式时长优先于分镜时长，但不允许低于台词总时长（闸门刚把 scene.duration 校准到位）
+    duration = clamp_duration(wanted_duration or scene.duration, project.settings.video_model)
+    audio_total = sum(
+        m.duration for m in (materials[x] for x in scene.binding.audios if x in materials) if m.duration
+    )
+    if audio_total and duration + AUDIO_FIT_TOL < audio_total:
+        duration = clamp_duration(int(audio_total + 0.999), project.settings.video_model)
+    if duration != scene.duration and scene.prompt:
+        # 显式改时长与 patch_scene 同一契约：Prompt 时间引用缩放到实际提交时长
+        scene.prompt, _ = prompt_timing.rescale_prompt_timing(scene.prompt, scene.duration, duration)
+        scene.revision += 1
+
+        def _apply_dur(p: Project) -> None:
+            s = _find_scene(p, scene_id)
+            if s:
+                s.prompt = scene.prompt
+                s.duration = duration
+                s.revision += 1
+
+        project_store.mutate(project_id, _apply_dur)
+        scene.duration = duration
+
     req = assemble_video_request(scene, materials, vmodel)
     if req["contract_error"]:
         return {"ok": False, "error": f"当前视频模型「{vmodel['label']}」：{req['contract_error']}"}
 
-    duration = clamp_duration(wanted_duration or scene.duration, project.settings.video_model)
     fingerprint = req["fingerprint"]
     job = job_manager.create("video", vmodel["provider"], vmodel["id"], {
         "mode": req["mode"], "prompt": req["prompt"][:300], "duration": duration,
         "aspect_ratio": project.aspect_ratio, "scene_id": scene_id, "project_id": project_id,
         "prompt_fingerprint": fingerprint,
     })
-    project_store.mutate(
-        project_id,
-        lambda p: _mark(p, scene_id, video_job=job["id"], status="generating", error=None, bump_attempt="video"),
-    )
+    replace_old = bool(scene.assets.video)  # force 重生成：新任务挂上时才清旧视频，中途校验失败不动旧产物
+
+    def _mark_submit(p: Project) -> None:
+        _mark(p, scene_id, video_job=job["id"], status="generating", error=None, bump_attempt="video")
+        if replace_old:
+            s = _find_scene(p, scene_id)
+            if s:
+                s.assets.video = None
+
+    project_store.mutate(project_id, _mark_submit)
+    if replace_old and trace:
+        trace.log("tool_result", tool="submit_video", scene_id=scene_id, force=True, cleared_video=True)
     job_manager.attach(
         job["id"],
         video_service.run_video_job(
@@ -519,13 +671,21 @@ def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int |
     asyncio.get_running_loop().create_task(_writeback_scene_video(project_id, scene_id, job["id"], fingerprint, trace))
     notes = "; ".join(req["notes"])
     note = "后台生成中" + (f"；{notes}" if notes else "")
+    if fit_note:
+        note += f"；{fit_note}"
     if wanted_duration and wanted_duration != duration:
-        note += f"；该镜设定 {wanted_duration}s 超出模型范围，已按 {duration}s 提交"
+        note += f"；该镜设定 {wanted_duration}s 受模型范围/台词时长限制，已按 {duration}s 提交"
     return {"ok": True, "job_id": job["id"], "scene_id": scene_id, "duration": duration, "note": note}
 
 
 async def _writeback_scene_video(project_id: str, scene_id: str, job_id: str, fingerprint: str, trace=None) -> None:
     """轮询视频任务到终态并经 project_store 写回（Prompt 指纹校验）。"""
+    def _mark_failed_if_current(p: Project, error: str) -> None:
+        s = _find_scene(p, scene_id)
+        if s and (not s.assets.video_job or s.assets.video_job == job_id):
+            s.status = "failed"
+            s.error = error[:300]
+
     waited = 0.0
     while waited < VIDEO_POLL_MAX:
         j = job_manager.get(job_id)
@@ -534,14 +694,14 @@ async def _writeback_scene_video(project_id: str, scene_id: str, job_id: str, fi
         if j["status"] == "completed":
             break
         if j["status"] == "failed":
-            project_store.mutate(project_id, lambda p: _mark(p, scene_id, status="failed", error=(j.get("error") or "视频生成失败")[:300]))
+            project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, j.get("error") or "视频生成失败"))
             if trace:
                 trace.log("tool_result", tool="submit_video", ok=False, job_id=job_id, error=j.get("error"))
             return
         await asyncio.sleep(5)
         waited += 5
     else:
-        project_store.mutate(project_id, lambda p: _mark(p, scene_id, status="failed", error="视频任务轮询超时"))
+        project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, "视频任务轮询超时"))
         return
     output = j.get("output")
 
@@ -549,6 +709,8 @@ async def _writeback_scene_video(project_id: str, scene_id: str, job_id: str, fi
         s = _find_scene(p, scene_id)
         if not s:
             return
+        if s.assets.video_job and s.assets.video_job != job_id:
+            return  # 本镜已被新任务接管（如 force 重生成），旧任务产物与状态都不再写回
         current_fp = prompt_fingerprint(s.prompt)
         if fingerprint and current_fp != fingerprint:
             s.status = "planned"

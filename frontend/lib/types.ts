@@ -59,6 +59,8 @@ export interface VoiceAsset {
   sample_url: string | null;
   /** MiniMax 服务端克隆音色 ID：有值时该资产可直接用于 speech 系列模型 */
   minimax_voice_id?: string | null;
+  /** 样本逐字稿：本地 Higgs TTS 克隆需要（其他厂商忽略） */
+  ref_text?: string;
   /** 同步克隆 MiniMax 失败时的原因（仅保存响应携带，列表接口不带） */
   minimax_error?: string | null;
   created_at?: string;
@@ -90,6 +92,8 @@ export interface Job {
   error: string | null;
   created_at: string;
   updated_at?: string;
+  /** 产物时长（秒）：TTS 为 ffprobe 实测精确值（取不到时为字节估算），旧任务可能缺失 */
+  duration_seconds?: number | null;
   self_check?: SelfCheck | null;
 }
 

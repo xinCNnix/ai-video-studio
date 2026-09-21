@@ -104,8 +104,10 @@ frontend/
 cd backend
 .venv/Scripts/python.exe tests/store_selfcheck.py      # 状态层：乐观锁/不变量/归档（14 项）
 .venv/Scripts/python.exe tests/reconcile_selfcheck.py  # 调谐器：顺序/幂等/重试/取消（21 项）
-.venv/Scripts/python.exe tests/pipeline_v2_selfcheck.py # 流水线：信封故障注入矩阵+端到端（24 项）
+.venv/Scripts/python.exe tests/pipeline_v2_selfcheck.py # 流水线：信封故障注入矩阵+H3六段式闸门+端到端（36 项）
 .venv/Scripts/python.exe tests/agent_v2_selfcheck.py   # Agent：路由/熔断/取消/single-flight（14 项）
+.venv/Scripts/python.exe tests/storyboard_fidelity_replay.py # storyboard 保真回归：真实事故项目重放（23 项）
+.venv/Scripts/python.exe tests/audio_fit_test.py       # 台词时长闸门：上传即显示精确时长/超镜自动校准/超模型上限拦截（19 项）
 ```
 
 ## 配置

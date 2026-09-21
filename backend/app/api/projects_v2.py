@@ -16,7 +16,7 @@ from pydantic import BaseModel
 from ..harness.bus import bus
 from ..harness.errors import InvariantViolation, ProjectNotFoundError, VersionConflictError
 from ..harness.state import ImageBinding, Scene, clamp_duration, new_scene_id
-from ..services import project_store
+from ..services import project_store, prompt_timing
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -146,8 +146,13 @@ async def patch_scene(project_id: str, scene_id: str, req: PatchSceneRequest):
         if req.gen_mode is not None:
             s.gen_mode = req.gen_mode
         if req.duration is not None:
-            # 唯一钳制点：按项目所选视频模型档位收敛
-            s.duration = clamp_duration(req.duration, p.settings.video_model)
+            new_duration = clamp_duration(req.duration, p.settings.video_model)
+            if new_duration != s.duration and s.prompt:
+                # 时长修正必须同步 Prompt 时间轴：Action Timeline/总时长引用停在旧时长
+                # 上，生成提交的就是自相矛盾的指令。用户显式提交了 prompt 时以提交值
+                # 为基准缩放（基准时长 = 修改前的分镜时长）
+                s.prompt, _ = prompt_timing.rescale_prompt_timing(s.prompt, s.duration, new_duration)
+            s.duration = new_duration
         s.revision += 1
 
     try:
@@ -270,17 +275,27 @@ async def add_materials(project_id: str, req: AddMaterialsRequest):
     from ..services.pipeline.stages import _infer_kind
 
     def fn(p) -> None:
+        from ..services import material_match
+
         existing = {m.url for m in p.materials if m.url}
         for item in req.materials[:50]:
             url = str(item.get("url") or "")
             if not url or url in existing:
                 continue
+            kind = str(item.get("kind") or _infer_kind(url))
+            text = (item.get("text") or None)
+            filename = str(item.get("filename") or url.rsplit("/", 1)[-1])[:200]
+            # 旧格式配音（uuid 命名提不出台词）+ voice 页带来的台词 → 合成语义文件名，
+            # 分镜 bind/素材清单按文件名提台词才能对号
+            if kind == "audio" and text:
+                filename = material_match.synthesize_audio_filename(url, str(text))[:200]
             p.materials.append(Material(
                 id=new_material_id(),
-                kind=str(item.get("kind") or _infer_kind(url)),
+                kind=kind,
                 url=url,
-                filename=str(item.get("filename") or url.rsplit("/", 1)[-1])[:200],
-                text=(item.get("text") or None),
+                filename=filename,
+                text=text,
+                duration=(float(item["duration"]) if item.get("duration") else None),
             ))
             existing.add(url)
 
@@ -295,6 +310,88 @@ async def add_materials(project_id: str, req: AddMaterialsRequest):
 
     asyncio.create_task(pipeline_stages.probe_audio_durations(project_id))
     return {"ok": True, "materials": snap.get("materials")}
+
+
+@router.post("/{project_id}/materials/reorder")
+async def reorder_materials(project_id: str, req: ReorderRequest):
+    """素材池重排（交换上传顺序）。storyboard 的 <Image N>/<Audio N> 全局编号按
+    上传顺序对齐——传错顺序时交换池内素材即可修正编号；已落到分镜上的绑定是
+    material_id 引用，不受影响（需要换绑时在分镜上手动调整）。"""
+    def fn(p) -> None:
+        by_id = {m.id: m for m in p.materials}
+        if len(req.order) != len(p.materials) or set(req.order) != set(by_id):
+            raise HTTPException(status_code=400, detail="order 必须是全部素材 id 的一个排列")
+        p.materials = [by_id[mid] for mid in req.order]
+
+    try:
+        return project_store.mutate(project_id, fn, base_version=req.base_version)
+    except HTTPException:
+        raise
+    except (ProjectNotFoundError, VersionConflictError, InvariantViolation) as exc:
+        raise _http(exc) from exc
+
+
+@router.delete("/{project_id}/materials/{material_id}")
+async def delete_material(project_id: str, material_id: str, base_version: int | None = None):
+    """删除单个素材：出池 + 解除全部分镜对它的绑定与待确认标记（不变量禁止悬空引用）。
+    底层文件不删——可能是任务产物，其他项目/历史仍在用。"""
+    def fn(p) -> None:
+        if not any(m.id == material_id for m in p.materials):
+            raise HTTPException(status_code=404, detail=f"素材不存在：{material_id}")
+        p.materials = [m for m in p.materials if m.id != material_id]
+        p.pending_bindings = [x for x in p.pending_bindings if x.material_id != material_id]
+        for s in p.scenes:
+            b = s.binding
+            before = (len(b.images), len(b.audios), len(b.videos))
+            b.images = [x for x in b.images if x.material_id != material_id]
+            b.audios = [x for x in b.audios if x != material_id]
+            b.videos = [x for x in b.videos if x != material_id]
+            if (len(b.images), len(b.audios), len(b.videos)) != before:
+                s.revision += 1
+
+    try:
+        return project_store.mutate(project_id, fn, base_version=base_version)
+    except HTTPException:
+        raise
+    except (ProjectNotFoundError, VersionConflictError, InvariantViolation) as exc:
+        raise _http(exc) from exc
+
+
+# ---------------- 清空重投（保留项目壳，内容全清） ----------------
+
+
+class ResetRequest(BaseModel):
+    base_version: int | None = None
+
+
+@router.post("/{project_id}/reset")
+async def reset_project_content(project_id: str, req: ResetRequest):
+    """清空重投：素材池/分镜/剧本/角色卡/待确认/成片引用全部清空，流水线回 empty。
+    保留：项目名、画幅、模型与门禁设置。任务进行中拒绝（防写竞争）。"""
+    from ..harness.watchdog import watchdog
+
+    active = watchdog.current(project_id)
+    if active and not active.get("stale"):
+        raise HTTPException(status_code=409, detail="项目有任务在进行中，请等它结束或先取消，再清空重投")
+
+    def fn(p) -> None:
+        p.materials = []
+        p.characters = []
+        p.scenes = []
+        p.screenplay = None
+        p.pending_bindings = []
+        p.final_video = None
+        p.pipeline.stage = "empty"
+        p.pipeline.state = "idle"
+        p.pipeline.awaiting = None
+        p.pipeline.error = None
+        p.pipeline.run_id = None
+        p.pipeline.history = []
+
+    try:
+        return project_store.mutate(project_id, fn, base_version=req.base_version)
+    except (ProjectNotFoundError, VersionConflictError, InvariantViolation) as exc:
+        raise _http(exc) from exc
 
 
 # ---------------- 手动生成（与 agent/pipeline 共用 generation_service） ----------------
@@ -324,7 +421,7 @@ async def generate_for_scene(project_id: str, scene_id: str, req: GenerateReques
         raise HTTPException(status_code=404, detail=f"分镜不存在：{scene_id}")
 
     if req.kind == "video":
-        result = generation_service.submit_scene_video(project_id, scene_id)
+        result = await generation_service.submit_scene_video(project_id, scene_id, force=req.force)
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result.get("error", "提交失败"))
         return result

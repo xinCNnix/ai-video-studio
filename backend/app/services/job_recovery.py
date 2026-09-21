@@ -63,6 +63,7 @@ async def _recover_video_job(job: dict) -> None:
         note = generation_service.writeback_completed_video(
             params["project_id"], params["scene_id"], output,
             str(params.get("prompt_fingerprint") or ""),
+            job_id=jid,
         )
         if note:
             job_manager.update(jid, writeback_note=note)

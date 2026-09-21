@@ -25,6 +25,7 @@ export default function ImagePage() {
   const loadCatalog = useAppStore((s) => s.loadCatalog);
   const loadCredentials = useAppStore((s) => s.loadCredentials);
   const setPendingVideo = useAppStore((s) => s.setPendingVideo);
+  const setPendingStudio = useAppStore((s) => s.setPendingStudio);
 
   const [modelId, setModelIdRaw] = useState(() => loadModelPref("image"));
   const setModelId = (id: string) => {
@@ -162,6 +163,10 @@ export default function ImagePage() {
           onSendToVideo={(url) => {
             setPendingVideo({ mode: "image", images: [url] });
             router.push("/video");
+          }}
+          onSendToStudio={(url) => {
+            setPendingStudio({ images: [url] });
+            router.push("/studio");
           }}
           onOpenImage={(url) => setLightbox(url)}
           onDeleteJob={(jobId) => void deleteJob(jobId)}

@@ -4,8 +4,11 @@
 无音色库、无可回传的 voice_id）。固化机制：把满意的一次设计输出保存为音频
 样本文件，之后该音色的所有合成自动切换到 voiceclone 协议，音色锚定在样本上。
 
-MiniMax 侧是服务端一次性克隆：保存资产时可选同步调 /v1/voice_clone 生成
-永久 voice_id（记录在 minimax_voice_id），之后 speech 系列模型直接复用。
+MiniMax 侧有两条服务端路径，产出均为永久 voice_id（记录在 minimax_voice_id，
+speech 系列模型直接复用）：
+- 声音克隆：保存资产时可选同步调 /v1/voice_clone（上传样本）
+- 音色设计：/api/voice/design-minimax 调 /v1/voice_design（文字描述文生音色），
+  试听音频顺势固化为样本，小米/Higgs 侧无需再次固化
 
 资产两类：
 - kind=clone：带样本文件，稳定复用（推荐形态）
@@ -56,6 +59,8 @@ def _public(a: dict) -> dict:
         "sample_url": f"/api/voice/assets/{a['id']}/sample" if (sample and sample.exists()) else None,
         # MiniMax 服务端克隆音色 ID（可选）：有值时该资产可直接用于 speech 系列模型
         "minimax_voice_id": a.get("minimax_voice_id") or None,
+        # 样本逐字稿（可选）：本地 Higgs TTS 克隆需要（小米/MiniMax 不用）
+        "ref_text": (a.get("ref_text") or "").strip(),
         "created_at": a.get("created_at"),
     }
 
@@ -77,8 +82,13 @@ def find_asset(value: str) -> dict | None:
     return named[0] if len(named) == 1 else None
 
 
-def create_asset(name: str, kind: str, desc: str = "", sample_src: Path | None = None) -> dict:
-    """创建音色资产。sample_src 为本地音频文件（mp3/wav），存在则固化为 clone。"""
+def create_asset(name: str, kind: str, desc: str = "", sample_src: Path | None = None,
+                 ref_text: str = "") -> dict:
+    """创建音色资产。sample_src 为本地音频文件（mp3/wav），存在则固化为 clone。
+
+    ref_text 为样本的逐字稿（可选）：本地 Higgs TTS 克隆时作为 --ref-text 传入，
+    与样本音频一一对应；其他厂商忽略该字段。
+    """
     name = (name or "").strip()
     if not name:
         raise ValueError("音色名不能为空")
@@ -100,6 +110,7 @@ def create_asset(name: str, kind: str, desc: str = "", sample_src: Path | None =
         "kind": kind if kind in ("clone", "design") else "design",
         "desc": (desc or "").strip(),
         "sample": sample_name,
+        "ref_text": (ref_text or "").strip(),
         "created_at": _now(),
     }
     items = _load()

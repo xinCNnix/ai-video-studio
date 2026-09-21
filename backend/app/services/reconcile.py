@@ -95,7 +95,7 @@ async def run_generate_stage(project_id: str, trace=None, cancel_check=None) -> 
         elif gap == "voice":
             r = await generation_service.generate_voice(project_id, scene.id, trace=trace)
         else:
-            r = generation_service.submit_scene_video(project_id, scene.id, trace=trace)
+            r = await generation_service.submit_scene_video(project_id, scene.id, trace=trace)
             if r.get("ok"):
                 summary["video"] += 1
                 await _wait_video_job(project_id, r["job_id"], cancel_check)

@@ -25,6 +25,8 @@ export function Topbar() {
   const setBackendOk = useAppStore((s) => s.setBackendOk);
   const agentOpen = useAppStore((s) => s.agentOpen);
   const setAgentOpen = useAppStore((s) => s.setAgentOpen);
+  // Studio 用页面自带的 Agent 控制台，这里不出「AI 助手」开关，防止侧栏串台
+  const showAgentToggle = !pathname.startsWith("/studio");
 
   useEffect(() => {
     const check = () =>
@@ -53,18 +55,20 @@ export function Topbar() {
           />
           {backendOk === false ? "后端未连接" : "API"}
         </div>
-        <button
-          type="button"
-          onClick={() => setAgentOpen(!agentOpen)}
-          title={agentOpen ? "收起 AI 助手" : "展开 AI 助手"}
-          className={cn(
-            "flex cursor-pointer items-center gap-1.5 rounded-md p-1.5 transition-colors hover:bg-white/[0.06]",
-            agentOpen ? "text-primary" : "text-muted-foreground hover:text-foreground"
-          )}
-        >
-          <Sparkles className="size-4.5" strokeWidth={1.8} />
-          <span className="hidden text-xs md:inline">AI 助手</span>
-        </button>
+        {showAgentToggle && (
+          <button
+            type="button"
+            onClick={() => setAgentOpen(!agentOpen)}
+            title={agentOpen ? "收起 AI 助手" : "展开 AI 助手"}
+            className={cn(
+              "flex cursor-pointer items-center gap-1.5 rounded-md p-1.5 transition-colors hover:bg-white/[0.06]",
+              agentOpen ? "text-primary" : "text-muted-foreground hover:text-foreground"
+            )}
+          >
+            <Sparkles className="size-4.5" strokeWidth={1.8} />
+            <span className="hidden text-xs md:inline">AI 助手</span>
+          </button>
+        )}
         <Link
           href="/settings"
           className="rounded-md p-1.5 text-muted-foreground transition-colors hover:bg-white/[0.06] hover:text-foreground"

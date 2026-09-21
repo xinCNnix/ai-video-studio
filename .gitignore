@@ -36,3 +36,6 @@ r10.json
 
 env
 .env*.local
+
+# 本地大模型权重（Higgs TTS 等本地推理）
+models/

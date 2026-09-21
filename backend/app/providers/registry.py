@@ -21,6 +21,7 @@ from .comfy_local import ComfyUILocal
 from .tts.minimax_tts import MiniMaxTTS
 from .tts.openai_tts import OpenAITTS
 from .tts.xiaomi_tts import XiaomiMiMoTTS
+from .tts.higgs_local import HiggsLocalTTS
 from .video.minimax_h3 import MiniMaxH3Video
 from .video.generic_video import GenericVideoProvider
 from .video.seedance import SeedanceVideo
@@ -187,6 +188,9 @@ def _require_endpoint(cred: dict, domain: str, message: str) -> None:
 
 
 def get_tts(credential_id: str | None, provider_hint: str | None = None) -> TTSProvider:
+    # Higgs 本地 ONNX：无凭据，subprocess 调 models/higgs/inference.py
+    if provider_hint == "higgs":
+        return HiggsLocalTTS()
     cred = _resolve_credential(credential_id, provider_hint or "minimax")
     base = cred.get("base_url") or ""
     # ComfyUI 本地 TTS：模板名 = 自定义语音模型 ID
@@ -296,6 +300,8 @@ def resolve_credential_label(credential_id: str | None, provider_hint: str | Non
     """解析本次调用将实际使用的凭据，返回展示名（写入任务记录，前端据此显示用的哪把 Key）。
     与 get_tts/get_image/get_video 的解析路径完全一致：显式指定 > 厂商默认 > 域名匹配 > 任意。
     """
+    if provider_hint == "higgs":
+        return "Higgs 本地模型（无需 Key）"
     try:
         cred = _resolve_credential(credential_id, provider_hint)
     except ProviderError:

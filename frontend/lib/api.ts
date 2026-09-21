@@ -46,6 +46,7 @@ export interface UploadedAttachment {
   name: string;
   url: string;
   text?: string; // doc 类型：剧本正文（发送时内联进消息，模型直接读全文）
+  duration?: number | null; // audio 类型：服务端 ffprobe 的精确时长（秒），分镜对齐用
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -98,8 +99,8 @@ export async function uploadAttachment(file: File, kind: UploadedAttachment["kin
     }
     throw new Error(detail || `上传失败 (${res.status})`);
   }
-  const data = (await res.json()) as { url: string; name: string; text?: string };
-  return { kind, name: data.name || file.name, url: data.url, text: data.text };
+  const data = (await res.json()) as { url: string; name: string; text?: string; duration?: number | null };
+  return { kind, name: data.name || file.name, url: data.url, text: data.text, duration: data.duration ?? null };
 }
 
 export const api = {
@@ -253,10 +254,13 @@ export const api = {
   }) => request<{ job_id: string; job: Job }>("/api/voice/generate", { method: "POST", body: JSON.stringify(body) }),
   // 音色资产：设计音色的固化与复用
   listVoiceAssets: () => request<{ assets: VoiceAsset[] }>("/api/voice/assets"),
-  saveVoiceAsset: (body: { name: string; kind?: string; desc?: string; sample_from?: string; sync_minimax?: boolean }) =>
+  saveVoiceAsset: (body: { name: string; kind?: string; desc?: string; sample_from?: string; ref_text?: string; sync_minimax?: boolean }) =>
     request<VoiceAsset>("/api/voice/assets", { method: "POST", body: JSON.stringify(body) }),
   retryVoiceAssetMinimax: (id: string) =>
     request<VoiceAsset>(`/api/voice/assets/${id}/clone-minimax`, { method: "POST", body: JSON.stringify({}) }),
+  // MiniMax 音色设计：文字描述 → 永久 voice_id，试听音频固化为资产样本
+  designMinimaxVoice: (body: { name: string; prompt: string; preview_text?: string }) =>
+    request<VoiceAsset>("/api/voice/design-minimax", { method: "POST", body: JSON.stringify(body) }),
   deleteVoiceAsset: (id: string) => request<{ ok: boolean }>(`/api/voice/assets/${id}`, { method: "DELETE" }),
   generateVideo: (body: {
     provider: string;
@@ -302,7 +306,8 @@ export const api = {
   // 流式执行 Agent：SSE 逐步回调工具步骤，结束后返回完整结果
   runAgentStream: async (
     body: AgentRunBody,
-    onStep?: (step: AgentRunResult["steps"][number]) => void
+    onStep?: (step: AgentRunResult["steps"][number]) => void,
+    onStarted?: (runId: string) => void
   ): Promise<AgentRunResult> => {
     const res = await fetch(`${API_BASE}/api/agent/run/stream`, {
       method: "POST",
@@ -326,13 +331,14 @@ export const api = {
     const handleEvent = (chunk: string) => {
       const line = chunk.split("\n").find((l) => l.startsWith("data: "));
       if (!line) return;
-      let evt: { type: string; step?: { step: number; type: string; tool?: string; text?: string; result?: unknown }; result?: AgentRunResult; message?: string };
+      let evt: { type: string; step?: { step: number; type: string; tool?: string; text?: string; result?: unknown }; result?: AgentRunResult; message?: string; run_id?: string };
       try {
         evt = JSON.parse(line.slice(6));
       } catch {
         return;
       }
       if (evt.type === "step") onStep?.(evt.step!);
+      else if (evt.type === "started" && evt.run_id) onStarted?.(evt.run_id);
       else if (evt.type === "error") throw new Error(evt.message || "Agent 运行失败");
       else if (evt.type === "final") final = evt.result ?? null;
     };
@@ -350,7 +356,9 @@ export const api = {
     if (!final) throw new Error("Agent 连接中断，未收到最终结果（已提交的后台任务不受影响）");
     return final;
   },
-  cancelAgent: () => request<{ ok: boolean }>("/api/agent/cancel", { method: "POST" }),};
+  // runId 缺省时后端视为"取消全部"：仅旧客户端兜底，正常都传当前 run 精确取消（防误杀 Studio 的 agent）
+  cancelAgent: (runId?: string) =>
+    request<{ ok: boolean }>("/api/agent/cancel", { method: "POST", body: JSON.stringify({ run_id: runId ?? "" }) }),};
 
 export async function pollJob(
   jobId: string,

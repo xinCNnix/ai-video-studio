@@ -88,6 +88,33 @@ sc2 = Scene(id="sc2", title="悬空标签", prompt="画面 <Picture 2>", duratio
 req2 = generation_service.assemble_video_request(sc2, {}, VMODEL)
 check("悬空 <Picture 2> 被拦截", req2["contract_error"] and "Picture" in req2["contract_error"])
 
+# 提交顺序=绑定顺序（吕满春白斑集事故）：旧实现按文件名语义重排参考图，"小墨"撞进
+# "吕满春+小墨双人"声明行，小墨图与双人图互换槽位——角色参考张冠李戴，每次生成必错
+MATS_IMG = {
+    "i1": Material(id="i1", kind="image", url="/u/a_lvmanchun.png", filename="a_lvmanchun.png"),
+    "i3": Material(id="i3", kind="image", url="/u/b_lvmanchundualren.png", filename="b_lvmanchundualren.png"),
+    "i4": Material(id="i4", kind="image", url="/u/c_小墨.png", filename="c_小墨.png"),
+}
+sc6 = Scene(id="sc6", title="顺序保真", gen_mode="t2v", duration=5,
+            prompt="<Picture 1>：吕满春多角度参考\n<Picture 2>：吕满春+小墨双人演播室参考\n<Picture 3>：小墨角色参考\n画面")
+for mid in ("i1", "i3", "i4"):
+    sc6.binding.images.append(ImageBinding(material_id=mid, role="reference"))
+req6 = generation_service.assemble_video_request(sc6, MATS_IMG, VMODEL)
+check("参考图按绑定顺序原样传入（语义撞名不再换位）",
+      req6["images"] == ["/u/a_lvmanchun.png", "/u/b_lvmanchundualren.png", "/u/c_小墨.png"],
+      f"{req6['images']}")
+
+# TTS 配音镜（H3 契约）：旁白音频在 assets.voice 不在绑定里——不传入则 <Audio 1> 悬空
+# 被闸门拦截、模型凭台词引号自行编造语音（事故：ad 项目无用户音频的镜全部生不了视频）
+sc7 = Scene(id="sc7", title="TTS配音镜", gen_mode="t2v", duration=5,
+            narration="边缘变深是好转线索",
+            prompt="<Audio 1> is the narration.\nAudio Timeline:\n0.0-4.5s | <Audio 1> | 旁白")
+sc7.assets.voice = "/u/tts_voice.mp3"
+req7 = generation_service.assemble_video_request(sc7, {}, VMODEL)
+check("TTS 配音作为 <Audio 1> 传入（不再被悬空标签拦截）",
+      req7["ref_audios"] == ["/u/tts_voice.mp3"] and not req7["contract_error"],
+      f"{req7['ref_audios']} {req7['contract_error']}")
+
 sc3 = Scene(id="sc3", title="音频标签无音频", prompt="<Audio 1> 台词", duration=5, gen_mode="t2v")
 req3 = generation_service.assemble_video_request(sc3, {}, VMODEL)
 check("有音频标签但没绑音频被拦截", req3["contract_error"] and "音频" in req3["contract_error"])
@@ -148,7 +175,7 @@ async def fake_voice(project_id, scene_id, **kw):
 fake_video_job_id = {"n": 0}
 
 
-def fake_video(project_id, scene_id, **kw):
+async def fake_video(project_id, scene_id, **kw):
     calls.append(("video", scene_id))
     fake_video_job_id["n"] += 1
     job = f"video_fake_{fake_video_job_id['n']}"
