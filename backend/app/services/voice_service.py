@@ -1,4 +1,9 @@
-"""TTS 语音生成任务执行服务。长文本自动分段合成后拼接（MP3 帧可直接拼接）。"""
+"""TTS 语音生成任务执行服务。
+
+整段（无标记）：长文本自动分段合成后 MP3 帧直拼。
+带工作台标记（片段情绪/音调/音量/语速/音色/停顿）：见 voice_script——
+逐段独立合成 + 静音插入 + ffmpeg 重编码拼接。
+"""
 import asyncio
 import re
 import subprocess
@@ -6,7 +11,7 @@ import subprocess
 from ..config import voice_assets
 from ..jobs import job_manager
 from ..providers import registry
-from . import file_service, self_check
+from . import file_service, self_check, voice_script
 
 MAX_CHUNK = 800
 
@@ -37,8 +42,20 @@ def split_text(text: str, max_len: int = MAX_CHUNK) -> list[str]:
     return chunks or [text]
 
 
+def _adapt_tags_for(text: str, provider: str, model: str) -> str:
+    """按厂商/模型保留或剥离 MiniMax 专属内联标签（语气词/注音）。"""
+    m = (model or "").lower()
+    is_minimax = provider == "minimax" or m.startswith("speech")
+    return voice_script.adapt_inline_tags(
+        text,
+        keep_paratags=is_minimax and "2.8" in m,   # 语气词标签仅 speech-2.8 系
+        keep_pinyin=is_minimax,
+    )
+
+
 async def run_voice_job(job_id: str, provider: str, model: str, credential_id: str | None,
-                        text: str, voice: str, speed: float, emotion: str) -> None:
+                        text: str, voice: str, speed: float, emotion: str,
+                        pitch: int = 0, vol: float = 1.0) -> None:
     jm = job_manager
     jm.update(job_id, status="generating")
     if not text or not text.strip():
@@ -47,16 +64,57 @@ async def run_voice_job(job_id: str, provider: str, model: str, credential_id: s
     tts = registry.get_tts(credential_id, provider_hint=provider)
     # 音色资产解析：命中的固化音色自动切换到克隆协议（样本锚定，稳定复用）
     model, voice = voice_assets.resolve_tts_voice(provider, model, voice)
-    chunks = split_text(text)
-    audio = b""
-    total = len(chunks)
-    for i, chunk in enumerate(chunks):
-        if total > 1:
-            jm.update(job_id, note=f"分段合成 {i + 1}/{total}")
-        audio += await tts.synthesize(text=chunk, model=model, voice=voice, speed=speed, emotion=emotion)
+    defaults = {"voice": voice, "speed": speed, "emotion": emotion, "pitch": int(pitch), "vol": vol}
+    parts = voice_script.parse(text)
+    if voice_script.has_markers(text):
+        # 分段路径：片段参数独立合成，段间停顿插静音后 ffmpeg 拼接
+        speech_parts = [p for p in parts if isinstance(p, voice_script.SpeechPart)]
+        total = len(speech_parts)
+        segments: list[tuple[bytes, float]] = []
+        idx = 0
+        for p in parts:
+            if isinstance(p, voice_script.PausePart):
+                if segments:
+                    audio, _ = segments[-1]
+                    segments[-1] = (audio, p.seconds)
+                continue
+            if not p.text.strip():
+                continue
+            if total > 1:
+                jm.update(job_id, note=f"分段合成 {idx + 1}/{total}")
+            merged_model, seg_voice = model, p.params(defaults)["voice"]
+            if seg_voice != voice:  # 片段音色可能是另一个资产：单独解析克隆协议
+                merged_model, seg_voice = voice_assets.resolve_tts_voice(provider, model, seg_voice)
+            params = p.params(defaults)
+            audio = await tts.synthesize(
+                text=_adapt_tags_for(p.text, provider, merged_model),
+                model=merged_model, voice=seg_voice,
+                speed=float(params["speed"]), emotion=str(params["emotion"]),
+                pitch=int(params["pitch"]), vol=float(params["vol"]),
+            )
+            segments.append((audio, 0.0))
+            idx += 1
+        jm.update(job_id, note="拼接分段音频")
+        audio_out = await voice_script.concat_audio(segments, reencode=True)
+    else:
+        # 整段路径（兼容原有行为）：长文按句分段合成后 MP3 帧直拼
+        chunks = split_text(_adapt_tags_for(text, provider, model))
+        audio_out = b""
+        total = len(chunks)
+        for i, chunk in enumerate(chunks):
+            if total > 1:
+                jm.update(job_id, note=f"分段合成 {i + 1}/{total}")
+            audio_out += await tts.synthesize(
+                text=chunk, model=model, voice=voice, speed=speed,
+                emotion=emotion, pitch=int(pitch), vol=vol,
+            )
     jm.update(job_id, status="downloading")
-    # 台词写入文件名：下游（素材清单/分镜 bind/编号互证）按文件名提台词对号
-    url = await file_service.save_output("audio", audio, name_hint=text)
+    # 台词写入文件名：下游（素材清单/分镜 bind/编号互证）按文件名提台词对号。
+    # 标记与厂商内联标签 ((laughs)/(he2)) 都不进文件名，只留可朗读正文
+    plain = voice_script.adapt_inline_tags(
+        voice_script.strip_markers(text).strip(), keep_paratags=False, keep_pinyin=False
+    ) or text.strip()
+    url = await file_service.save_output("audio", audio_out, name_hint=plain)
     local = file_service.resolve_local(url)
     exact_seconds = None
     if local and local.exists():
@@ -71,14 +129,14 @@ async def run_voice_job(job_id: str, provider: str, model: str, credential_id: s
             exact_seconds = round(float(out), 2)
         except Exception:  # noqa: BLE001 - ffprobe 不可用时回退估算
             exact_seconds = None
-    est_seconds = exact_seconds if exact_seconds else round(self_check.estimate_audio_seconds(audio), 1)
+    est_seconds = exact_seconds if exact_seconds else round(self_check.estimate_audio_seconds(audio_out), 1)
     jm.update(
         job_id,
         status="completed",
         output=url,
         outputs=[url],
         duration_seconds=est_seconds,
-        self_check=self_check.check_audio(audio),
+        self_check=self_check.check_audio(audio_out),
     )
 
 

@@ -75,7 +75,7 @@ export function AudioPlayer({
           className="inline-flex items-center gap-1.5 rounded-lg border border-border px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:text-foreground"
         >
           <Download className="size-3.5" />
-          Download
+          下载
         </a>
         {onSendToStudio && (
           <button
@@ -83,7 +83,7 @@ export function AudioPlayer({
             onClick={onSendToStudio}
             className="inline-flex cursor-pointer items-center gap-1.5 rounded-lg border border-primary/40 bg-primary/10 px-3 py-1.5 text-xs text-primary transition-colors hover:bg-primary/20"
           >
-            Send to Studio
+            发送到 Studio
           </button>
         )}
       </div>

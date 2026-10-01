@@ -2,8 +2,10 @@
 
 依赖系统 ffmpeg（PATH）。流程：
 1. 收集有视频的分镜（按顺序），缺视频的分镜跳过并在结果中提示；
-2. 逐镜归一化（统一分辨率/帧率/编码），无旁白的分镜补静音轨（concat -c copy
-   要求各片段音轨一致——历史上"部分分镜有旁白"的项目导出即失败，已修复）；
+2. 逐镜归一化（统一分辨率/帧率/编码）：有旁白 assets.voice 则整轨替换；无旁白
+   保留分镜原片音轨（绑定台词音频由视频模型烧进原声，扔掉即成片无声）；原片
+   无音轨才补静音（concat -c copy 要求各片段音轨一致——历史上"部分分镜有
+   旁白"的项目导出即失败，已修复）；
 3. concat demuxer 无损拼接 → outputs/video/ 下的成片文件 → project_store 写回。
 """
 import asyncio
@@ -31,6 +33,20 @@ def ffmpeg_path() -> str:
     return p
 
 
+async def _has_audio_stream(path: Path) -> bool:
+    """分镜原片是否自带音轨（决定导出保留原声还是补静音）。"""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        raise RuntimeError("未找到 ffprobe：请安装 ffmpeg（含 ffprobe）并加入 PATH 后重试。")
+    proc = await asyncio.create_subprocess_exec(
+        ffprobe, "-v", "error", "-select_streams", "a",
+        "-show_entries", "stream=index", "-of", "csv=p=0", str(path),
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+    )
+    out, _ = await asyncio.wait_for(proc.communicate(), timeout=60)
+    return bool(out.strip())
+
+
 async def _run_ffmpeg(args: list[str]) -> None:
     proc = await asyncio.create_subprocess_exec(
         *args,
@@ -51,7 +67,7 @@ def _local(url: str) -> Path | None:
 
 
 async def export_project_v2(project_id: str) -> dict:
-    """v2 项目导出：归一化（含静音轨修复）→ concat → 写回 final_video。"""
+    """v2 项目导出：归一化（旁白替换/原声保留/静音补齐）→ concat → 写回 final_video。"""
     from ..harness.state import Project
     from . import project_store
 
@@ -81,8 +97,11 @@ async def export_project_v2(project_id: str) -> dict:
             voice = _local(scene.assets.voice or "") if scene.assets.voice else None
             if voice:
                 cmd += ["-i", str(voice), "-map", "0:v:0", "-map", "1:a:0", "-shortest"]
+            elif await _has_audio_stream(clip):
+                # 无独立旁白但原片自带音轨（绑定台词音频被视频模型烧进原声）：保留原声
+                cmd += ["-map", "0:v:0", "-map", "0:a:0", "-shortest"]
             else:
-                # 无旁白分镜补静音轨：所有归一化片段统一带 AAC 音轨，
+                # 原片确实无音轨才补静音：所有归一化片段统一带 AAC 音轨，
                 # concat -c copy 才不会因音轨有无不一致而失败/错位
                 cmd += [
                     "-f", "lavfi", "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
@@ -93,7 +112,7 @@ async def export_project_v2(project_id: str) -> dict:
                 f"scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2",
                 "-r", "30",
                 "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-                "-c:a", "aac", "-ar", "44100",
+                "-c:a", "aac", "-ar", "44100", "-ac", "2",
                 str(out),
             ]
             await _run_ffmpeg(cmd)

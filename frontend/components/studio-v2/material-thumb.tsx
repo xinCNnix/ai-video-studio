@@ -9,11 +9,14 @@ import { cn } from "@/lib/utils";
 export function MaterialThumb({
   src,
   badge,
+  badgeTone = "default",
   title,
   className,
 }: {
   src: string;
   badge?: string;
+  /** warn = 琥珀色：同名重复副本（重N），与正常上传序号区分开 */
+  badgeTone?: "default" | "warn";
   title?: string;
   className?: string;
 }) {
@@ -29,10 +32,15 @@ export function MaterialThumb({
           className,
         )}
       >
-        {/* eslint-disable-next-line @next/next/no-img-element */}
+        {/* eslint-disable-next-line @nextjs/next/no-img-element */}
         <img src={fileUrl(src)} alt={title ?? ""} loading="lazy" className="size-full object-cover" />
         {badge && (
-          <span className="absolute left-0.5 top-0.5 rounded bg-black/70 px-1 text-[9px] font-semibold leading-4 text-white">
+          <span
+            className={cn(
+              "absolute left-0.5 top-0.5 rounded bg-black/70 px-1 text-[9px] font-semibold leading-4 text-white",
+              badgeTone === "warn" && "bg-amber-600/90",
+            )}
+          >
             {badge}
           </span>
         )}

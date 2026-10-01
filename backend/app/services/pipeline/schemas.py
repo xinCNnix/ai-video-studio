@@ -115,6 +115,26 @@ class PlanBatchH3(PlanBatch):
         return self
 
 
+class PolishedPrompt(BaseModel):
+    """director 润色遍的单镜输出契约：必须是完整的 H3 六段式。
+
+    校验失败由信封回喂修复；修不好由调用方兜底保留草稿（润色绝不让规划失败）。
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    prompt: str
+
+    @field_validator("prompt")
+    @classmethod
+    def _h3_complete(cls, v: str) -> str:
+        if len((v or "").strip()) < 300:
+            raise ValueError("润色结果过短：需要完整的 H3 六段式 Prompt（detailed_description 350-500 英文词）")
+        missing = [m for m in H3_SECTION_MARKERS if m not in (v or "").lower()]
+        if missing:
+            raise ValueError(f"润色结果缺少 H3 必需段：{', '.join(missing)}（六段必须齐全，段名逐字使用）")
+        return v
+
+
 class BindDecision(BaseModel):
     model_config = ConfigDict(extra="ignore")
 

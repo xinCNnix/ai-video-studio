@@ -175,7 +175,24 @@ def main() -> None:
             "wants_videos": [],
         })
     plan_output = json.dumps({"shots": plan_shots, "total": len(plan_shots), "done": True}, ensure_ascii=False)
-    env = llm_client.LLMEnvelope(FakeLLM([plan_output]), "m")
+
+    class PlanWindowLLM:
+        """分窗规划假模型：按用户消息里的“全稿第 X–Y 镜”返回该窗的镜（一拍一镜，
+        每窗一次到位），任何窗口重试（数量错误反馈）也按窗口号重新应答"""
+
+        def __init__(self, shots):
+            self.shots = shots
+            self.calls = 0
+
+        async def generate(self, messages, model, temperature=0.7, max_tokens=None):
+            self.calls += 1
+            user = messages[-1]["content"]
+            m = re.search(r"全稿第 (\d+)[–-](\d+) 镜", user)
+            lo, hi = (int(m.group(1)), int(m.group(2))) if m else (1, len(self.shots))
+            ws = self.shots[lo - 1:hi]
+            return json.dumps({"shots": ws, "total": len(ws), "done": True}, ensure_ascii=False)
+
+    env = llm_client.LLMEnvelope(PlanWindowLLM(plan_shots), "m")
     asyncio.run(stages.run_plan(PID, env))
     proj = project_store.get(PID)
     check("prompt 不再拼原文块（原文只在 screenplay.beats 供前端展示）",

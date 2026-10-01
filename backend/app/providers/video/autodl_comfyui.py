@@ -151,7 +151,9 @@ class AutoDLComfyUI(VideoProvider):
         if status == "success":
             url = _find_video_url(data.get("results"))
             if not url:
-                return ("failed", None, f"任务成功但未找到视频地址：{str(data)[:200]}")
+                # 云端已 SUCCESS（钱已花）但结果列表还没出地址：按运行中继续轮询，
+                # 由外层 MAX_POLL_SECONDS 兜底——不能在这里宣判失败把钱扔掉
+                return ("running", None, None)
             return ("success", url, None)
         if status == "failed":
             return ("failed", None, data.get("message") or "AutoDL 工作流执行失败")

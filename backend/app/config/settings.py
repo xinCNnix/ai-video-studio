@@ -106,6 +106,8 @@ PROVIDER_CATALOG: dict[str, dict] = {
 # LLM / 生图模型优先从凭据的 /models 接口自动发现，或在设置中添加自定义模型 ID。
 LLM_MODELS: list[dict] = [
     {"id": "MiniMax-M2", "label": "MiniMax M2", "provider": "minimax"},
+    {"id": "mimo-v2.6-pro", "label": "MiMo V2.6 Pro", "provider": "xiaomi"},
+    {"id": "mimo-v2.6-flash", "label": "MiMo V2.6 Flash（高效推理）", "provider": "xiaomi"},
 ]
 
 # TTS 模型：小米 MiMo 系列接口协议私有（chat/completions 形态），模型 ID 固定，
@@ -121,7 +123,7 @@ TTS_MODELS: list[dict] = [
 # 也可在设置中添加自定义音色 ID。
 TTS_VOICES: list[dict] = []
 
-TTS_EMOTIONS: list[str] = ["neutral", "happy", "sad", "angry", "fearful", "surprised", "calm"]
+TTS_EMOTIONS: list[str] = ["neutral", "happy", "sad", "angry", "fearful", "disgusted", "surprised", "calm"]
 
 IMAGE_MODELS: list[dict] = [
     {"id": "gpt-image-2", "label": "GPT Image 2", "provider": "openai"},

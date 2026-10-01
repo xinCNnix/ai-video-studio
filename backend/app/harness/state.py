@@ -44,6 +44,12 @@ class ProjectSettings(BaseModel):
     resolution: str = "auto"
     # review 门禁旁路：True 时 bind 完成直接进 generate，不等用户确认
     auto_generate: bool = False
+    # 润色总开关：False = 不改稿。H3 成稿拍（原文已是定稿 H3 Prompt）plan 阶段零 LLM
+    # 逐字直录（时段/镜头结构/风格/摄影原样进模型，仅做 Reference→wants、Audio
+    # Timeline 物化等机械适配）；其余稿件跳过 director 润色遍、直接采用草稿 Prompt。
+    # storyboard 成稿或润色反复破坏原文锁定构图时建议关闭（2026-09-22 第4集镜3/4/8
+    # 润色发明机位三连事故；2026-10-01 单镜成稿被重拆 [Shot 1]-[Shot 5]/时段重排）
+    prompt_polish: bool = True
 
 
 class Material(BaseModel):

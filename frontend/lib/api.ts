@@ -252,6 +252,8 @@ export const api = {
     voice: string;
     speed: number;
     emotion: string;
+    pitch?: number;
+    vol?: number;
   }) => request<{ job_id: string; job: Job }>("/api/voice/generate", { method: "POST", body: JSON.stringify(body) }),
   // 音色资产：设计音色的固化与复用
   listVoiceAssets: () => request<{ assets: VoiceAsset[] }>("/api/voice/assets"),

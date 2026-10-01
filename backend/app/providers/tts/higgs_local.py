@@ -107,7 +107,7 @@ def _venv_python() -> Path:
     return p
 
 
-def _prefill_tags(emotion: str, speed: float) -> str:
+def _prefill_tags(emotion: str, speed: float, pitch: int = 0) -> str:
     tags = ""
     emo = map_emotion(emotion)
     if emo:
@@ -115,6 +115,9 @@ def _prefill_tags(emotion: str, speed: float) -> str:
     spd = map_speed(speed)
     if spd:
         tags += f"<|prosody:{spd}|>"
+    # 连续音调值 → 档位标签（Higgs 只有 pitch_low/pitch_high 两档，无音量控制）
+    if pitch:
+        tags += "<|prosody:pitch_high|>" if pitch > 0 else "<|prosody:pitch_low|>"
     return tags
 
 
@@ -161,13 +164,15 @@ class HiggsLocalTTS(TTSProvider):
         voice: str,
         speed: float = 1.0,
         emotion: str = "neutral",
+        pitch: int = 0,
+        vol: float = 1.0,
     ) -> bytes:
         self._check_env()
         ref_audio, ref_text = _resolve_voice(voice)
         chunks = split_for_ar(text)
         if not chunks:
             raise ProviderError("配音文本为空。")
-        tags = _prefill_tags(emotion, speed)
+        tags = _prefill_tags(emotion, speed, pitch)
 
         async with RUN_LOCK:          # 串行：CPU 上一个会话已占满核
             with tempfile.TemporaryDirectory(prefix="higgs_tts_") as td:

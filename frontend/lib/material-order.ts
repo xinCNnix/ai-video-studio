@@ -39,6 +39,28 @@ export function materialOrders<T extends OrderableMaterial>(list: T[]): (number 
   });
 }
 
+/** 与 materialOrders 同一轮判重，但给每个"重复不占号"的素材返回它折叠到的那一号
+ * （同 URL / 同语义文件名的首个副本的序号）。编号为 null 且本函数非 null 的素材 =
+ * 同身份重复拷贝——投放面板据此显示「重N」角标并解释，而不是一张没有编号的裸图
+ * （曾让用户误以为编号跳号漏了一张图）。 */
+export function materialDupOfs<T extends OrderableMaterial>(list: T[]): (number | null)[] {
+  const urlToOrder = new Map<string, number>();
+  const keyToOrder = new Map<string, number>();
+  const counters: Record<string, number> = {};
+  return list.map((m) => {
+    if (m.kind === "script" || m.kind === "doc") return null;
+    if (m.url && urlToOrder.has(m.url)) return urlToOrder.get(m.url)!;
+    const fk = semanticFileKey(m.filename || m.url || "");
+    const key = `${m.kind}\u0000${fk}`;
+    if (fk && keyToOrder.has(key)) return keyToOrder.get(key)!;
+    counters[m.kind] = (counters[m.kind] ?? 0) + 1;
+    const order = counters[m.kind];
+    if (m.url) urlToOrder.set(m.url, order);
+    if (fk) keyToOrder.set(key, order);
+    return null;
+  });
+}
+
 const KIND_LABELS: Record<string, string> = { image: "图", audio: "音", video: "视" };
 
 export function orderLabel(kind: string, order: number | null | undefined): string {

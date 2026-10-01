@@ -155,9 +155,17 @@ class MiniMaxTTS(TTSProvider):
         voice: str,
         speed: float = 1.0,
         emotion: str = "neutral",
+        pitch: int = 0,
+        vol: float = 1.0,
     ) -> bytes:
         params = {"GroupId": self.group_id} if self.group_id else None
-        voice_setting: dict = {"voice_id": voice, "speed": max(0.5, min(2.0, speed)), "vol": 1.0, "pitch": 0}
+        # pitch/vol 官方要求整数（非整数报 2013），范围 [-12,12] / [1,10]
+        voice_setting: dict = {
+            "voice_id": voice,
+            "speed": max(0.5, min(2.0, speed)),
+            "vol": max(1, min(10, int(round(vol)))),
+            "pitch": max(-12, min(12, int(round(pitch)))),
+        }
         if emotion and emotion != "neutral":
             voice_setting["emotion"] = emotion
         body = {

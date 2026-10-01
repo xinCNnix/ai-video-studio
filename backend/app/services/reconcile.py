@@ -2,8 +2,15 @@
 
 每镜的"期望"由状态声明：有 narration → 期望 voice；i2v 且无用户参考图 → 期望
 keyframe；有 prompt → 期望 video。调谐循环反复求差、逐项补齐，直到差距清零或
-重试预算耗尽（转 failed 交人工）。提交幂等：活跃 job / 已有产物的项不重复提交，
-重跑不重复烧钱。
+预算耗尽（转 failed 交人工）。
+
+计费安全（自动链路不烧冤枉钱）：
+- video 自动提交每镜至多一次（MAX_ATTEMPTS=1 + 提交侧 attempts>=1 拦截），
+  失败/重生成一律人工触发
+- 幂等由提交侧原子占位保证（见 generation_service.submit_scene_video）：
+  进行中 / 写回中 / 已有产物的镜不会重复提交
+- 等待以分镜终态为准（产物落地/failed/被接管），杜绝「任务完成→写回落地」
+  空窗里的重复提交
 """
 import asyncio
 
@@ -12,14 +19,16 @@ from ..harness.watchdog import watchdog
 from ..jobs import job_manager
 from . import generation_service, project_store
 
-MAX_ATTEMPTS = {"keyframe": 2, "voice": 2, "video": 2}
+MAX_ATTEMPTS = {"keyframe": 2, "voice": 2, "video": 1}  # video=1：自动链路每镜只提交一次，重生成必须人工触发
 JOB_POLL_INTERVAL = 5
 
 
-def scene_gaps(scene: Scene) -> tuple[list[str], str | None]:
+def scene_gaps(scene: Scene, project_id: str = "") -> tuple[list[str], str | None]:
     """计算一镜的资产差距。返回 (可执行差距列表, 不可执行的阻塞原因)。
 
     顺序即执行顺序：keyframe → voice → video；前置不满足时 video 不进列表。
+    video 缺口判定含「产物写回中」：任务已终态但产物未落镜的窗口不算缺口，
+    否则会被重新提交——重复计费事故的根因之一。
     """
     if scene.assets.video and scene.status == "done":
         return [], None
@@ -47,6 +56,7 @@ def scene_gaps(scene: Scene) -> tuple[list[str], str | None]:
         and scene.prompt.strip()
         and not scene.assets.video
         and not generation_service.job_active(scene.assets.video_job)
+        and not generation_service.video_writeback_pending(project_id, scene.id, scene.assets.video_job)
     ):
         gaps.append("video")
     return gaps, block
@@ -73,7 +83,7 @@ async def run_generate_stage(project_id: str, trace=None, cancel_check=None) -> 
 
         target = None
         for scene in project.scenes:
-            gaps, block = scene_gaps(scene)
+            gaps, block = scene_gaps(scene, project_id)
             if block:
                 summary["blocked"].append({"scene_id": scene.id, "title": scene.title, "reason": block})
                 _mark_failed(project_id, scene.id, block)
@@ -95,10 +105,10 @@ async def run_generate_stage(project_id: str, trace=None, cancel_check=None) -> 
         elif gap == "voice":
             r = await generation_service.generate_voice(project_id, scene.id, trace=trace)
         else:
-            r = await generation_service.submit_scene_video(project_id, scene.id, trace=trace)
+            r = await generation_service.submit_scene_video(project_id, scene.id, trace=trace, manual=False)
             if r.get("ok"):
                 summary["video"] += 1
-                await _wait_video_job(project_id, r["job_id"], cancel_check)
+                await _wait_video_job(project_id, scene.id, r["job_id"], cancel_check)
                 continue
         if r.get("ok"):
             summary[gap] = summary.get(gap, 0) + 1
@@ -119,13 +129,33 @@ def _mark_failed(project_id: str, scene_id: str, reason: str) -> None:
         pass
 
 
-async def _wait_video_job(project_id: str, job_id: str, cancel_check=None) -> None:
-    """等待视频任务终态（写回由 generation_service 的后台任务完成，这里只等结果）。"""
-    while True:
+async def _wait_video_job(project_id: str, scene_id: str, job_id: str, cancel_check=None) -> None:
+    """等待该镜视频到明确终态：以 project_store 里的分镜状态为准
+    （产物已写回 / failed / 已被新任务接管），而不是 job_manager 的任务状态。
+
+    任务「已完成」与产物「已写回」之间存在空窗——只等任务终态会把该镜重新
+    判成缺口而重复提交（重复计费事故的根因）。写回协程已死（重启）时任务终态
+    但在途登记为空，同样返回，交由下一轮按缺口处理。
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + generation_service.VIDEO_POLL_MAX + 60
+    while loop.time() < deadline:
         if cancel_check and cancel_check():
             return
         watchdog.heartbeat(project_id)
-        j = job_manager.get(job_id)
-        if not j or j["status"] in ("completed", "failed"):
+        p = project_store.get(project_id)
+        scene = next((x for x in (p or {}).get("scenes", []) if x.get("id") == scene_id), None)
+        if scene is None:
             return
+        assets = scene.get("assets") or {}
+        if assets.get("video") or scene.get("status") in ("done", "failed"):
+            return
+        if (assets.get("video_job") or None) != job_id:
+            return  # 已被 force 重生成接管
+        j = job_manager.get(job_id)
+        if not j:
+            return
+        if j["status"] in ("completed", "failed") and \
+                not generation_service.video_writeback_pending(project_id, scene_id, job_id):
+            return  # 任务终态且写回协程已不在（重启/异常退出），交由下一轮判定
         await asyncio.sleep(JOB_POLL_INTERVAL)

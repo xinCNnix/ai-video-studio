@@ -7,7 +7,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, ChevronUp, FileText, Loader2, Mic, Paperclip, Play, X } from "lucide-react";
 import { toast } from "sonner";
 import { uploadMaterial } from "@/lib/api-v2";
-import { displayFilename, materialOrders, orderLabel } from "@/lib/material-order";
+import { displayFilename, materialDupOfs, materialOrders, orderLabel } from "@/lib/material-order";
 import { MaterialThumb } from "@/components/studio-v2/material-thumb";
 import { useAppStore } from "@/stores/app-store";
 import { useStudioV2Store } from "@/stores/studio-v2-store";
@@ -55,12 +55,24 @@ export function IntakePanel() {
     () => (project?.materials ?? []).filter((m) => m.kind !== "script" && m.kind !== "doc"),
     [project?.materials],
   );
-  const poolOrders = useMemo(() => materialOrders(poolMats), [poolMats]);
+  const poolOrders = useMemo(
+    () => materialOrders(poolMats),
+    [poolMats],
+  );
+  const poolDupOfs = useMemo(
+    () => materialDupOfs(poolMats),
+    [poolMats],
+  );
   // 待投素材序号：把池内素材拼在前面一起编号——已在池内（同 URL/同身份）的待投项
   // 不占新号，与后端 intake 入池判重一致
+  const pendingBase = useMemo(() => [...poolMats, ...materials], [poolMats, materials]);
   const pendingOrders = useMemo(
-    () => materialOrders([...poolMats, ...materials]).slice(poolMats.length),
-    [poolMats, materials],
+    () => materialOrders(pendingBase).slice(poolMats.length),
+    [pendingBase, poolMats.length],
+  );
+  const pendingDupOfs = useMemo(
+    () => materialDupOfs(pendingBase).slice(poolMats.length),
+    [pendingBase, poolMats.length],
   );
 
   const addFiles = async (files: FileList | File[]) => {
@@ -120,7 +132,14 @@ export function IntakePanel() {
     },
   };
 
-  const orderTitle = (kind: string, order: number | null | undefined, filename: string) => {
+  const orderTitle = (kind: string, order: number | null | undefined, dupOf: number | null | undefined, filename: string) => {
+    if (order == null && dupOf != null) {
+      // 同名/同 URL 副本：折叠到 dupOf 号不占号。不解释清楚会被当成"编号跳号漏了一张图"
+      const twin = orderLabel(kind, dupOf);
+      const tag = kind === "image" ? `<Image ${dupOf}>` : kind === "audio" ? `<Audio ${dupOf}>` : "";
+      return `${filename}｜同名副本（重${dupOf}）：与 ${twin} 同文件名，视为同一素材不占号${tag ? `，${twin} = 原稿 ${tag}` : ""}。` +
+        `要用这个版本就删掉 ${twin} 那张，本张会自动接上编号；两版都要用请给本张改名后重新上传`;
+    }
     const label = orderLabel(kind, order);
     if (!label) return filename;
     const tag = kind === "image" ? `<Image ${order}>` : kind === "audio" ? `<Audio ${order}>` : "";
@@ -184,8 +203,8 @@ export function IntakePanel() {
         <div className="mt-2">
           <div className="mb-1 text-[10px] text-muted-foreground">
             素材池 {poolMats.length} 项（{isStoryboard
-              ? "编号 = 原稿 <Image N>/<Audio N>；传错顺序用悬停箭头交换。已绑到分镜的素材不受影响，换绑请到分镜抽屉"
-              : "图/音按上传顺序编号，悬停箭头可交换顺序"}）
+              ? "编号 = 原稿 <Image N>/<Audio N>；传错顺序用悬停箭头交换；标「重N」的是同名副本（不占号，入池时忽略）。已绑到分镜的素材不受影响，换绑请到分镜抽屉"
+              : "图/音按上传顺序编号，悬停箭头可交换顺序；标「重N」的是同名副本（不占号）"}）
           </div>
           <div className="flex max-h-36 flex-wrap items-center gap-2 overflow-y-auto pr-1">
             {poolMats.map((m, i) =>
@@ -193,8 +212,9 @@ export function IntakePanel() {
                 <div key={m.id} className="group relative">
                   <MaterialThumb
                     src={m.url}
-                    badge={orderLabel("image", poolOrders[i])}
-                    title={orderTitle("image", poolOrders[i], displayFilename(m.filename))}
+                    badge={orderLabel("image", poolOrders[i]) || (poolDupOfs[i] != null ? `重${poolDupOfs[i]}` : undefined)}
+                    badgeTone={poolOrders[i] == null && poolDupOfs[i] != null ? "warn" : "default"}
+                    title={orderTitle("image", poolOrders[i], poolDupOfs[i], displayFilename(m.filename))}
                     className="size-12"
                   />
                   <button
@@ -227,13 +247,15 @@ export function IntakePanel() {
               ) : (
                 <span
                   key={m.id}
-                  title={orderTitle(m.kind, poolOrders[i], displayFilename(m.filename))}
+                  title={orderTitle(m.kind, poolOrders[i], poolDupOfs[i], displayFilename(m.filename))}
                   className="group inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/50 px-2 py-1 text-[11px]"
                 >
                   {m.kind === "audio" ? <Mic className="size-3" /> : <FileText className="size-3" />}
-                  {orderLabel(m.kind, poolOrders[i]) && (
+                  {orderLabel(m.kind, poolOrders[i]) ? (
                     <span className="font-semibold text-primary">{orderLabel(m.kind, poolOrders[i])}</span>
-                  )}
+                  ) : poolDupOfs[i] != null ? (
+                    <span className="font-semibold text-amber-400">重{poolDupOfs[i]}</span>
+                  ) : null}
                   {displayFilename(m.filename)}
                   {m.kind === "audio" && durBadge(m.duration)}
                   <span className="hidden items-center gap-0.5 group-hover:inline-flex">
@@ -254,19 +276,21 @@ export function IntakePanel() {
         <div className="mt-2">
           <div className="mb-1 text-[10px] text-muted-foreground">
             本次待投 {materials.length} 项（{isStoryboard
-              ? "序号接续素材池，= 原稿 <Image N>/<Audio N>；顺序错了用悬停箭头调整"
-              : "图/音按上传顺序编号，悬停箭头可调整顺序"}）
+              ? "序号接续素材池，= 原稿 <Image N>/<Audio N>；顺序错了用悬停箭头调整；标「重N」的是同名副本（不占号，入池时忽略）"
+              : "图/音按上传顺序编号，悬停箭头可调整顺序；标「重N」的是同名副本（不占号）"}）
           </div>
           <div className="flex max-h-40 flex-wrap items-start gap-2 overflow-y-auto pr-1">
             {materials.map((m, i) => {
               const order = pendingOrders[i];
+              const dupOf = pendingDupOfs[i];
               if (m.kind === "image") {
                 return (
                   <div key={m.url} className="group relative">
                     <MaterialThumb
                       src={m.url}
-                      badge={orderLabel("image", order)}
-                      title={orderTitle("image", order, displayFilename(m.filename))}
+                      badge={orderLabel("image", order) || (dupOf != null ? `重${dupOf}` : undefined)}
+                      badgeTone={order == null && dupOf != null ? "warn" : "default"}
+                      title={orderTitle("image", order, dupOf, displayFilename(m.filename))}
                     />
                     <button
                       type="button"
@@ -300,13 +324,15 @@ export function IntakePanel() {
               return (
                 <span
                   key={m.url}
-                  title={orderTitle(m.kind, order, displayFilename(m.filename))}
+                  title={orderTitle(m.kind, order, dupOf, displayFilename(m.filename))}
                   className="group inline-flex items-center gap-1.5 rounded-lg border border-border bg-secondary/50 px-2 py-1 text-[11px]"
                 >
                   {m.kind === "audio" ? <Mic className="size-3" /> : <FileText className="size-3" />}
-                  {orderLabel(m.kind, order) && (
+                  {orderLabel(m.kind, order) ? (
                     <span className="font-semibold text-primary">{orderLabel(m.kind, order)}</span>
-                  )}
+                  ) : dupOf != null ? (
+                    <span className="font-semibold text-amber-400">重{dupOf}</span>
+                  ) : null}
                   {displayFilename(m.filename)}
                   {m.kind === "audio" && durBadge(m.duration)}
                   <span className="hidden items-center gap-0.5 group-hover:inline-flex">

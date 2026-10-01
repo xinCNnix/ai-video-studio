@@ -21,6 +21,8 @@ class OpenAITTS(TTSProvider):
         voice: str,
         speed: float = 1.0,
         emotion: str = "neutral",
+        pitch: int = 0,
+        vol: float = 1.0,
     ) -> bytes:
         body: dict = {
             "model": model,
@@ -29,9 +31,14 @@ class OpenAITTS(TTSProvider):
             "speed": max(0.25, min(4.0, speed)),
             "response_format": "mp3",
         }
-        # emotion 非开放标准字段：仅在用户显式选择时携带，兼容厂商读取，标准端点会忽略
+        # emotion/pitch/vol 非开放标准字段：仅在用户显式设置时携带，兼容厂商
+        # 读取，标准 OpenAI 端点会忽略未知字段
         if emotion and emotion != "neutral":
             body["emotion"] = emotion
+        if pitch:
+            body["pitch"] = max(-12, min(12, int(round(pitch))))
+        if vol and abs(vol - 1.0) > 0.05:
+            body["vol"] = vol
         try:
             async with httpx.AsyncClient(timeout=120) as client:
                 resp = await client.post(

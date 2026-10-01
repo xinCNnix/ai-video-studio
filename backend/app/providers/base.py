@@ -38,6 +38,8 @@ class TTSProvider(ABC):
         voice: str,
         speed: float = 1.0,
         emotion: str = "neutral",
+        pitch: int = 0,
+        vol: float = 1.0,
     ) -> bytes: ...
 
 

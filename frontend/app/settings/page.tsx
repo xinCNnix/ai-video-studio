@@ -589,7 +589,7 @@ export default function SettingsPage() {
             <div className="mb-1 text-sm font-semibold">默认文本模型（Agent / Prompt 链路使用）</div>
             <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
               Agent / 流水线（剧本解析、分镜规划、素材绑定）、AI 助手等所有文本链路都使用这里的选择。
-              选凭据后列表只显示该凭据端点上的模型；列表没有的模型可直接搜索后回车手动指定（例如 mimo-v2.5-pro）。
+              选凭据后列表只显示该凭据端点上的模型；列表没有的模型可直接搜索后回车手动指定（例如 mimo-v2.6-pro）。
               改完记得点「保存」，保存后对新任务即刻生效。
             </p>
             <div className="flex flex-wrap items-center gap-2">

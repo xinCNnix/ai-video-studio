@@ -374,7 +374,7 @@ async def tool_generate_for_scene(agent, args: dict) -> dict:
                 trace=agent.trace)
         else:
             results["video"] = await generation_service.submit_scene_video(
-                agent.project_id, scene_id, force=bool(args.get("force")), trace=agent.trace)
+                agent.project_id, scene_id, force=bool(args.get("force")), manual=True, trace=agent.trace)
     ok = all(r.get("ok") for r in results.values() if isinstance(r, dict))
     return {"ok": ok, "results": results}
 

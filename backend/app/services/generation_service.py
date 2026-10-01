@@ -25,6 +25,19 @@ from . import file_service, image_service, material_match, prompt_timing, video_
 from . import project_store
 
 VIDEO_POLL_MAX = 25 * 60  # 写回侧轮询上限（生成侧 20min + 下载余量）
+VIDEO_POLL_INTERVAL = 5
+
+# 「任务已完成、产物尚未写回」的在途登记（project_id, scene_id, job_id）。
+# 占位拦截靠它区分「写回中」（拦截重提交）与「写回协程已死」（放行重生成）；
+# 进程重启后为空——恰好对应写回协程确实已死的事实，方向永不判反。
+_pending_video_writebacks: set[tuple[str, str, str]] = set()
+
+
+def video_writeback_pending(project_id: str, scene_id: str, job_id: str | None) -> bool:
+    """该镜视频是否处于「任务已终态、产物写回中/在途」状态。
+
+    提交侧与调谐侧共用：这一窗口内该镜不是缺口，也绝不允许再提交（重复计费）。"""
+    return bool(job_id) and (project_id, scene_id, job_id) in _pending_video_writebacks
 
 
 def prompt_fingerprint(text: str) -> str:
@@ -272,34 +285,42 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
 
 
 def writeback_completed_video(project_id: str, scene_id: str, output: str, fingerprint: str = "", job_id: str | None = None) -> str | None:
-    """把已完成的视频产物写回 v2 分镜（重启恢复路径复用；指纹校验）。
+    """把已完成的视频产物写回 v2 分镜（提交写回与重启恢复共用）。
 
-    返回 None = 成功；字符串 = 未写回原因。
+    钱已经花掉，产物必须落回分镜——判定（接管/指纹）与写回在同一把项目锁内
+    原子完成。指纹失配时释放 video_job 槽位（否则该镜永久卡在「已完成未写回」，
+    人工重生成也会被占位拦截）。返回 None = 成功；字符串 = 未写回原因。
     """
     try:
-        project = project_store.get(project_id)
-        if not project:
+        if not project_store.get(project_id):
             return f"项目 {project_id} 不存在，无法写回"
-        scene = next((s for s in project.get("scenes") or [] if s.get("id") == scene_id), None)
-        if not scene:
-            return f"分镜 {scene_id} 已不存在，无法写回"
-        current_job = (scene.get("assets") or {}).get("video_job")
-        if job_id and current_job and current_job != job_id:
-            return f"分镜 {scene_id} 已由新任务接管（当前 job {current_job}），产物未写回"
-        current_fp = prompt_fingerprint(scene.get("prompt") or "")
-        if fingerprint and current_fp != fingerprint:
-            return f"分镜 {scene_id} 的 Prompt 在生成期间已被改写（提交指纹 {fingerprint}，当前 {current_fp}），产物未写回"
+        result: list[str | None] = [None]
 
         def fn(p: Project) -> None:
             s = _find_scene(p, scene_id)
             if not s:
+                result[0] = f"分镜 {scene_id} 已不存在，无法写回"
+                return
+            if job_id and s.assets.video_job and s.assets.video_job != job_id:
+                result[0] = f"分镜 {scene_id} 已由新任务接管（当前 job {s.assets.video_job}），产物未写回"
+                return
+            if fingerprint and prompt_fingerprint(s.prompt) != fingerprint:
+                reason = (f"分镜 {scene_id} 的 Prompt 在生成期间已被改写"
+                          f"（提交指纹 {fingerprint}，当前 {prompt_fingerprint(s.prompt)}），"
+                          "产物未写回，可在任务历史中下载")
+                s.assets.video_job = None
+                s.status = "planned"
+                s.error = reason
+                result[0] = reason
                 return
             s.assets.video = output
+            if job_id:
+                s.assets.video_job = job_id
             s.status = "done"
             s.error = None
 
         project_store.mutate(project_id, fn)
-        return None
+        return result[0]
     except Exception as exc:  # noqa: BLE001
         return f"写回分镜 {scene_id} 失败：{str(exc)[:150]}"
 
@@ -583,9 +604,18 @@ async def ensure_scene_audio_fit(project: Project, scene: Scene, project_id: str
     return note, None
 
 
-async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int | None = None, trace=None, force: bool = False) -> dict:
+async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration: int | None = None, trace=None, force: bool = False, manual: bool = False) -> dict:
     """提交一镜视频生成（非阻塞）。Prompt 从项目分镜原样读取，用户内容不经过
-    任何模型输出通道；唯一确定性改写是 <Audio N> 重编号。"""
+    任何模型输出通道；唯一确定性改写是 <Audio N> 重编号。
+
+    计费安全——检查与占位在同一次 project_store.mutate（项目互斥锁）内完成，
+    通过后才 attach 服务商调用；任何被拦截的提交不产生服务商请求、零计费：
+    - 进行中任务 / 已完成但产物写回中 / 已有视频（需 force）→ 拦截
+    - 自动链路（manual=False，pipeline/调谐）对同一镜只许提交一次，
+      之后的重生成必须人工触发（按钮/agent），attempts>=1 即拦截
+    - 提交期间 Prompt 被并发修改（指纹漂移）→ 拦截：按旧 Prompt 生成的产物
+      会被写回侧丢弃，等于白烧钱
+    """
     project_dict = project_store.get(project_id)
     if not project_dict:
         return {"ok": False, "error": "项目不存在"}
@@ -593,12 +623,6 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
     scene = _find_scene(project, scene_id)
     if not scene:
         return {"ok": False, "error": f"分镜不存在：{scene_id}"}
-    if not scene.prompt.strip():
-        return {"ok": False, "error": f"分镜「{scene.title}」没有 Prompt，无法生成视频"}
-    if job_active(scene.assets.video_job):
-        return {"ok": False, "error": "该分镜已有进行中的视频任务", "job_id": scene.assets.video_job}
-    if scene.assets.video and not force:
-        return {"ok": False, "error": "该分镜已有视频，重新生成需 force 覆盖", "video": scene.assets.video}
 
     # 台词时长闸门：绑定音频总时长放不下时模型会把台词压缩变形，先校准/拦截
     fit_note, fit_error = await ensure_scene_audio_fit(project, scene, project_id)
@@ -642,17 +666,59 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
         "aspect_ratio": project.aspect_ratio, "scene_id": scene_id, "project_id": project_id,
         "prompt_fingerprint": fingerprint,
     })
-    replace_old = bool(scene.assets.video)  # force 重生成：新任务挂上时才清旧视频，中途校验失败不动旧产物
 
-    def _mark_submit(p: Project) -> None:
+    # 原子占位：全部拦截判定与 video_job 指派在同一把项目锁内完成，并发提交
+    # 只有一个能赢。未通过则任务从未 attach——服务商零调用零计费，删记录即可。
+    verdict: dict = {}
+
+    def _claim(p: Project) -> None:
+        s = _find_scene(p, scene_id)
+        if not s:
+            verdict["error"] = f"分镜不存在：{scene_id}"
+            return
+        if not s.prompt.strip():
+            verdict["error"] = f"分镜「{s.title}」没有 Prompt，无法生成视频"
+            return
+        if fingerprint and prompt_fingerprint(s.prompt) != fingerprint:
+            verdict["error"] = "提交期间 Prompt 已被修改，已拦截（旧 Prompt 的产物写回会被丢弃，白烧钱）；请重新提交"
+            return
+        if not manual and s.attempts.get("video", 0) >= 1:
+            verdict["error"] = "自动重提交已收回：该镜已有提交记录，重生成需人工触发"
+            return
+        prev_job = s.assets.video_job
+        if prev_job and prev_job != job["id"]:
+            pj = job_manager.get(prev_job)
+            if pj and pj.get("status") in ACTIVE_STATUSES:
+                verdict["error"] = "该分镜已有进行中的视频任务"
+                verdict["job_id"] = prev_job
+                return
+            if pj and pj.get("status") == "completed" and not s.assets.video \
+                    and (project_id, scene_id, prev_job) in _pending_video_writebacks:
+                verdict["error"] = "上一任务已完成、产物写回中，已拦截重复提交（避免重复计费）"
+                verdict["job_id"] = prev_job
+                return
+        if s.assets.video and not force:
+            verdict["error"] = "该分镜已有视频，重新生成需 force 覆盖"
+            verdict["video"] = s.assets.video
+            return
         _mark(p, scene_id, video_job=job["id"], status="generating", error=None, bump_attempt="video")
-        if replace_old:
-            s = _find_scene(p, scene_id)
-            if s:
-                s.assets.video = None
+        if force and s.assets.video:
+            s.assets.video = None  # force 重生成：占位成功这一刻才清旧视频
+        verdict["ok"] = True
 
-    project_store.mutate(project_id, _mark_submit)
-    if replace_old and trace:
+    try:
+        project_store.mutate(project_id, _claim)
+    except Exception as exc:  # noqa: BLE001
+        job_manager.delete(job["id"])
+        return {"ok": False, "error": f"提交占位失败（未调用服务商）：{str(exc)[:200]}"}
+    if not verdict.get("ok"):
+        job_manager.delete(job["id"])
+        if trace:
+            trace.log("tool_result", tool="submit_video", ok=False, scene_id=scene_id, error=verdict.get("error"))
+        return {"ok": False, "error": verdict.get("error"),
+                **{k: v for k, v in verdict.items() if k not in ("error", "ok")}}
+
+    if force and trace:
         trace.log("tool_result", tool="submit_video", scene_id=scene_id, force=True, cleared_video=True)
     job_manager.attach(
         job["id"],
@@ -667,7 +733,9 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
     if trace:
         trace.log("tool_call", tool="submit_video", scene_id=scene_id, job_id=job["id"],
                   model=vmodel["id"], mode=req["mode"], duration=duration)
-    # 后端兜底写回：前端关页也不丢结果（指纹校验后落盘）
+    # 后端兜底写回：前端关页也不丢结果（指纹校验后落盘）。
+    # 在途登记必须先于任务挂起同步完成，占位拦截从此刻起即可见。
+    _pending_video_writebacks.add((project_id, scene_id, job["id"]))
     asyncio.get_running_loop().create_task(_writeback_scene_video(project_id, scene_id, job["id"], fingerprint, trace))
     notes = "; ".join(req["notes"])
     note = "后台生成中" + (f"；{notes}" if notes else "")
@@ -679,48 +747,45 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
 
 
 async def _writeback_scene_video(project_id: str, scene_id: str, job_id: str, fingerprint: str, trace=None) -> None:
-    """轮询视频任务到终态并经 project_store 写回（Prompt 指纹校验）。"""
+    """轮询视频任务到终态并写回（Prompt 指纹校验）。
+
+    钱已花，产物必须落回分镜：成功走 writeback_completed_video（接管/指纹判定
+    在锁内原子完成）；失败把分镜标 failed（保留任务历史可人工重试）。finally
+    清除在途登记——每个出口都把分镜带到明确终态，不留给调谐循环重新判缺口的窗口。
+    """
+    key = (project_id, scene_id, job_id)
+    _pending_video_writebacks.add(key)
+
     def _mark_failed_if_current(p: Project, error: str) -> None:
         s = _find_scene(p, scene_id)
         if s and (not s.assets.video_job or s.assets.video_job == job_id):
             s.status = "failed"
             s.error = error[:300]
 
-    waited = 0.0
-    while waited < VIDEO_POLL_MAX:
-        j = job_manager.get(job_id)
-        if not j:
+    try:
+        waited = 0.0
+        while waited < VIDEO_POLL_MAX:
+            j = job_manager.get(job_id)
+            if not j:
+                return
+            if j["status"] == "completed":
+                note = writeback_completed_video(
+                    project_id, scene_id, j.get("output") or "", fingerprint, job_id=job_id,
+                )
+                if trace:
+                    trace.log("tool_result", tool="submit_video", ok=not note, job_id=job_id,
+                              output=None if note else j.get("output"), error=note)
+                return
+            if j["status"] == "failed":
+                err = j.get("error") or "视频生成失败"
+                project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, err))
+                if trace:
+                    trace.log("tool_result", tool="submit_video", ok=False, job_id=job_id, error=err)
+                return
+            await asyncio.sleep(VIDEO_POLL_INTERVAL)
+            waited += VIDEO_POLL_INTERVAL
+        else:
+            project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, "视频任务轮询超时"))
             return
-        if j["status"] == "completed":
-            break
-        if j["status"] == "failed":
-            project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, j.get("error") or "视频生成失败"))
-            if trace:
-                trace.log("tool_result", tool="submit_video", ok=False, job_id=job_id, error=j.get("error"))
-            return
-        await asyncio.sleep(5)
-        waited += 5
-    else:
-        project_store.mutate(project_id, lambda p: _mark_failed_if_current(p, "视频任务轮询超时"))
-        return
-    output = j.get("output")
-
-    def _write(p: Project) -> None:
-        s = _find_scene(p, scene_id)
-        if not s:
-            return
-        if s.assets.video_job and s.assets.video_job != job_id:
-            return  # 本镜已被新任务接管（如 force 重生成），旧任务产物与状态都不再写回
-        current_fp = prompt_fingerprint(s.prompt)
-        if fingerprint and current_fp != fingerprint:
-            s.status = "planned"
-            s.error = "视频生成期间 Prompt 已被修改，产物未写回（可在任务历史中下载旧视频）"
-            return
-        s.assets.video = output
-        s.assets.video_job = job_id
-        s.status = "done"
-        s.error = None
-
-    project_store.mutate(project_id, _write)
-    if trace:
-        trace.log("tool_result", tool="submit_video", ok=True, job_id=job_id, output=output)
+    finally:
+        _pending_video_writebacks.discard(key)

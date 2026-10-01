@@ -15,6 +15,8 @@ export interface ProjectSettings {
   voice_id: string | null;
   resolution: string;
   auto_generate: boolean;
+  /** plan 导演润色遍开关（关闭=直接采用草稿 Prompt） */
+  prompt_polish: boolean;
 }
 
 export interface Material {

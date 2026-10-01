@@ -230,6 +230,19 @@ export default function StudioPage() {
           全自动
         </label>
 
+        <label
+          className="flex cursor-pointer items-center gap-1.5 text-[11px] text-muted-foreground"
+          title="分镜 Prompt 润色（director pass）：开启时规划后逐镜润色到导演级写作；关闭时直接采用草稿 Prompt。分镜稿已成稿（原文即定稿 H3 Prompt）或润色破坏原文锁定的构图/机位时建议关闭，对下一次规划生效"
+        >
+          <input
+            type="checkbox"
+            checked={project.settings.prompt_polish}
+            onChange={(e) => void patchSettings({ prompt_polish: e.target.checked })}
+            className="accent-primary"
+          />
+          分镜润色
+        </label>
+
         <div className="flex-1" />
 
         <span className={cn("inline-flex items-center gap-1 text-[10px]", sseConnected ? "text-emerald-400" : "text-muted-foreground")}>

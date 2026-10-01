@@ -41,7 +41,19 @@ def check(name: str, cond: bool, detail: str = ""):
 
 
 class FakeLLM:
-    """脚本化假 LLM：按序返回预设输出（str 或 Exception）。"""
+    """脚本化假 LLM：按序返回预设输出（str 或 Exception）。
+
+    director 润色遍（system 含「润色导演」）以达标 canned 六段式应答——润色遍是
+    run_plan 的必经调用，不接管会吃空脚本序列、触发空输出退避重试。"""
+
+    POLISH_OK = (
+        "subject_definitions:\n<Subject 1> is a stylized 3D character.\n\n"
+        "summary:\n[reference generation] One continuous shot.\n\n"
+        "retention_analysis:\n<Subject 1> (appears in [Shot 1]): fully_preserved - identity follows the anchor.\n\n"
+        "detailed_description:\n[Shot 1] "
+        + "The camera moves forward at slow speed while the subject walks ahead steadily. " * 40
+        + "\n\noverall_soundscape:\nQuiet morning city tone.\n\nnon_diegetic_music: N/A"
+    )
 
     def __init__(self, outputs: list):
         self.outputs = list(outputs)
@@ -49,6 +61,8 @@ class FakeLLM:
 
     async def generate(self, messages, model, temperature=0.7, max_tokens=None):
         self.calls += 1
+        if messages and "润色导演" in (messages[0].get("content") or ""):
+            return json.dumps({"prompt": self.POLISH_OK}, ensure_ascii=False)
         item = self.outputs.pop(0) if self.outputs else ""
         if isinstance(item, Exception):
             raise item

@@ -423,7 +423,7 @@ export function CloneVoicePanel({
                 rows={3}
               />
               <p className="text-[10px] leading-relaxed text-muted-foreground/70">
-                逐字稿与样本对得越准，克隆出的音色越像。左侧 Emotion/Speed 与正文标签仍可正常叠加使用。
+                逐字稿与样本对得越准，克隆出的音色越像。左侧「情绪 / 语速」与正文标签仍可正常叠加使用。
               </p>
             </div>
           )}
@@ -477,19 +477,24 @@ export function CloneVoicePanel({
             上传一段自己的声音，保存后即可用它朗读任意文案
           </div>
         )}
-        {clones.map((a) => (
-          <CloneSampleRow
-            key={a.id}
-            asset={a}
-            selected={selected === a.id}
-            playingId={playingId}
-            onPlayingChange={setPlayingId}
-            onSelect={() => onSelect(a)}
-            onRetryMinimax={hasMinimaxKey ? () => void retryMinimax(a) : undefined}
-            retrying={retryingId === a.id}
-            onDelete={() => onDelete(a)}
-          />
-        ))}
+        {/* 列表限高滚动：条目多时不把下方的朗读参数挤出视口 */}
+        {clones.length > 0 && (
+          <div className="max-h-72 space-y-1.5 overflow-y-auto pr-0.5">
+            {clones.map((a) => (
+              <CloneSampleRow
+                key={a.id}
+                asset={a}
+                selected={selected === a.id}
+                playingId={playingId}
+                onPlayingChange={setPlayingId}
+                onSelect={() => onSelect(a)}
+                onRetryMinimax={hasMinimaxKey ? () => void retryMinimax(a) : undefined}
+                retrying={retryingId === a.id}
+                onDelete={() => onDelete(a)}
+              />
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

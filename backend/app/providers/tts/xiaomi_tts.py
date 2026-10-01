@@ -22,9 +22,32 @@ _EMOTION_STYLE = {
     "sad": "悲伤",
     "angry": "愤怒",
     "fearful": "恐惧",
+    "disgusted": "厌恶",
     "surprised": "惊讶",
     "calm": "沉着平静",
 }
+
+# 音调/音量 → 自然语言描述（小米无结构化参数，靠指令近似）
+def _pitch_style(pitch: int) -> str:
+    p = int(round(pitch))
+    if p >= 6:
+        return "音调明显高亢"
+    if p >= 2:
+        return "音调略高、轻快上扬"
+    if p <= -6:
+        return "音调明显低沉"
+    if p <= -2:
+        return "音调略低、沉稳压低"
+    return ""
+
+
+def _vol_style(vol: float) -> str:
+    v = float(vol or 1.0)
+    if v >= 6:
+        return "声音洪亮有力"
+    if v >= 2.5:
+        return "声音略大"
+    return ""
 
 # 预置音色（官方文档静态列表；平台无音色查询接口，配置小米凭据后由发现接口下发）
 XIAOMI_PRESET_VOICES: list[dict] = [
@@ -47,7 +70,10 @@ class XiaomiMiMoTTS(TTSProvider):
         self.api_key = api_key
         self.base_url = base
 
-    def _build_messages(self, text: str, model: str, voice: str, speed: float, emotion: str) -> tuple[list[dict], dict]:
+    def _build_messages(
+        self, text: str, model: str, voice: str, speed: float, emotion: str,
+        pitch: int = 0, vol: float = 1.0,
+    ) -> tuple[list[dict], dict]:
         """组装 messages 与 audio 参数。返回 (messages, audio_setting)。"""
         is_design = model.endswith("voicedesign")
         is_clone = model.endswith("voiceclone")
@@ -60,6 +86,12 @@ class XiaomiMiMoTTS(TTSProvider):
                 tags += f"（{_EMOTION_STYLE[emotion]}）"
             if abs(speed - 1.0) > 0.05:
                 tags += "（语速加快）" if speed > 1.0 else "（语速放慢）"
+            if pitch:
+                style = _pitch_style(pitch)
+                if style:
+                    tags += f"（{style}）"
+            if vol and vol >= 2.5:
+                tags += f"（{_vol_style(vol)}）"
             return (
                 [
                     {"role": "user", "content": voice or "中年男声，温和沉稳"},
@@ -73,6 +105,12 @@ class XiaomiMiMoTTS(TTSProvider):
             style_parts.append(f"用{_EMOTION_STYLE.get(emotion, emotion)}的语气朗读")
         if abs(speed - 1.0) > 0.05:
             style_parts.append(f"整体语速约为正常语速的{speed:.1f}倍")
+        if pitch:
+            style = _pitch_style(pitch)
+            if style:
+                style_parts.append(style)
+        if vol and vol >= 2.5:
+            style_parts.append(_vol_style(vol))
         if is_clone:
             if not (voice or "").startswith("data:audio"):
                 raise ProviderError(
@@ -95,8 +133,10 @@ class XiaomiMiMoTTS(TTSProvider):
         voice: str,
         speed: float = 1.0,
         emotion: str = "neutral",
+        pitch: int = 0,
+        vol: float = 1.0,
     ) -> bytes:
-        messages, audio_setting = self._build_messages(text, model, voice, speed, emotion)
+        messages, audio_setting = self._build_messages(text, model, voice, speed, emotion, pitch, vol)
         body = {"model": model, "messages": messages, "stream": False, "audio": audio_setting}
         data: dict = {}
         last_err: Exception | None = None

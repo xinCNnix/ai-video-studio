@@ -421,7 +421,7 @@ async def generate_for_scene(project_id: str, scene_id: str, req: GenerateReques
         raise HTTPException(status_code=404, detail=f"分镜不存在：{scene_id}")
 
     if req.kind == "video":
-        result = await generation_service.submit_scene_video(project_id, scene_id, force=req.force)
+        result = await generation_service.submit_scene_video(project_id, scene_id, force=req.force, manual=True)
         if not result.get("ok"):
             raise HTTPException(status_code=400, detail=result.get("error", "提交失败"))
         return result

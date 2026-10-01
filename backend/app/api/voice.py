@@ -21,17 +21,25 @@ class VoiceRequest(BaseModel):
     provider: str = "minimax"
     model: str = Field(min_length=1)
     credential_id: str | None = None
+    # text 可含配音工作台内联标记：[happy]…[/happy] 片段情绪、[pitch:3]/[vol:2]/
+    # [speed:1.2]/[voice:ID] 片段参数、<#0.5#> 停顿（voice_script 解析）
     text: str = Field(min_length=1)
     voice: str = Field(min_length=1)
     speed: float = 1.0
     emotion: str = "neutral"
+    pitch: int = 0    # 音调（MiniMax 半音，-12~12）
+    vol: float = 1.0  # 音量（1~10，1 为常规音量）
 
 
 @router.post("/generate")
 async def generate(req: VoiceRequest):
     if len(req.text) > 20000:
         raise HTTPException(status_code=400, detail="文本过长（上限 20000 字，超长部分自动分段合成）")
-    params = {"text": req.text[:120], "voice": req.voice, "speed": req.speed, "emotion": req.emotion, "model": req.model}
+    params = {
+        "text": req.text[:120], "voice": req.voice, "speed": req.speed,
+        "emotion": req.emotion, "model": req.model,
+        "pitch": req.pitch, "vol": req.vol,
+    }
     # 记录实际将使用的凭据（与 run_voice_job 内 get_tts 的解析一致），前端历史据此显示用的哪把 Key
     cred_label = registry.resolve_credential_label(req.credential_id, req.provider)
     if cred_label:
@@ -48,6 +56,8 @@ async def generate(req: VoiceRequest):
             voice=req.voice,
             speed=req.speed,
             emotion=req.emotion,
+            pitch=req.pitch,
+            vol=req.vol,
         ),
     )
     return {"job_id": job["id"], "job": job}

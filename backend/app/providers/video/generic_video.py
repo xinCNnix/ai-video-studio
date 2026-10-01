@@ -127,7 +127,9 @@ class GenericVideoProvider(VideoProvider):
         if status in ("completed", "succeeded", "success"):
             url = _find_url(data)
             if not url:
-                return ("failed", None, f"任务完成但未找到视频地址：{str(data)[:200]}")
+                # 云端已完成（钱已花）但响应里还没出地址：按运行中继续轮询，
+                # 由外层 MAX_POLL_SECONDS 兜底——不能在这里宣判失败把钱扔掉
+                return ("running", None, None)
             return ("success", url, None)
         if status in ("failed", "error"):
             return ("failed", None, data.get("error") or "视频生成失败")
