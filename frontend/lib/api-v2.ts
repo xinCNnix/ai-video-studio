@@ -181,10 +181,10 @@ export async function cancelAgentV2(runId: string): Promise<void> {
 
 // ---------------- 素材上传（复用 v1 上传端点，取得 URL 后随 pipeline start 提交） ----------------
 
-export async function uploadMaterial(file: File): Promise<{ url: string; kind: MaterialKind; filename: string; text?: string; duration?: number | null }> {
+export async function uploadMaterial(file: File): Promise<{ url: string; kind: MaterialKind; filename: string; text?: string; text_truncated?: boolean; duration?: number | null }> {
   const kind = attachmentKind(file) ?? "doc";
   const att = await uploadAttachment(file, kind);
-  return { url: att.url, kind, filename: att.name, text: att.text, duration: att.duration };
+  return { url: att.url, kind, filename: att.name, text: att.text, text_truncated: att.text_truncated, duration: att.duration };
 }
 
 export type { PendingBinding, PipelineInfo, ProjectSummaryV2, ProjectV2, SceneV2 };

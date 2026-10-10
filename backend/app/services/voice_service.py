@@ -3,6 +3,8 @@
 整段（无标记）：长文本自动分段合成后 MP3 帧直拼。
 带工作台标记（片段情绪/音调/音量/语速/音色/停顿）：见 voice_script——
 逐段独立合成 + 静音插入 + ffmpeg 重编码拼接。
+takes > 1：多版本挑优——同一参数重掷 N 版，按韵律评分（问句看句尾升幅，
+陈述句看语调起伏，见 prosody）保留最好的一版，对抗厂商合成的语调随机性。
 """
 import asyncio
 import re
@@ -11,7 +13,7 @@ import subprocess
 from ..config import voice_assets
 from ..jobs import job_manager
 from ..providers import registry
-from . import file_service, self_check, voice_script
+from . import file_service, prosody, self_check, voice_script
 
 MAX_CHUNK = 800
 
@@ -55,7 +57,7 @@ def _adapt_tags_for(text: str, provider: str, model: str) -> str:
 
 async def run_voice_job(job_id: str, provider: str, model: str, credential_id: str | None,
                         text: str, voice: str, speed: float, emotion: str,
-                        pitch: int = 0, vol: float = 1.0) -> None:
+                        pitch: int = 0, vol: float = 1.0, takes: int = 1) -> None:
     jm = job_manager
     jm.update(job_id, status="generating")
     if not text or not text.strip():
@@ -66,48 +68,72 @@ async def run_voice_job(job_id: str, provider: str, model: str, credential_id: s
     model, voice = voice_assets.resolve_tts_voice(provider, model, voice)
     defaults = {"voice": voice, "speed": speed, "emotion": emotion, "pitch": int(pitch), "vol": vol}
     parts = voice_script.parse(text)
-    if voice_script.has_markers(text):
-        # 分段路径：片段参数独立合成，段间停顿插静音后 ffmpeg 拼接
-        speech_parts = [p for p in parts if isinstance(p, voice_script.SpeechPart)]
-        total = len(speech_parts)
-        segments: list[tuple[bytes, float]] = []
-        idx = 0
-        for p in parts:
-            if isinstance(p, voice_script.PausePart):
-                if segments:
-                    audio, _ = segments[-1]
-                    segments[-1] = (audio, p.seconds)
-                continue
-            if not p.text.strip():
-                continue
-            if total > 1:
-                jm.update(job_id, note=f"分段合成 {idx + 1}/{total}")
-            merged_model, seg_voice = model, p.params(defaults)["voice"]
-            if seg_voice != voice:  # 片段音色可能是另一个资产：单独解析克隆协议
-                merged_model, seg_voice = voice_assets.resolve_tts_voice(provider, model, seg_voice)
-            params = p.params(defaults)
-            audio = await tts.synthesize(
-                text=_adapt_tags_for(p.text, provider, merged_model),
-                model=merged_model, voice=seg_voice,
-                speed=float(params["speed"]), emotion=str(params["emotion"]),
-                pitch=int(params["pitch"]), vol=float(params["vol"]),
-            )
-            segments.append((audio, 0.0))
-            idx += 1
-        jm.update(job_id, note="拼接分段音频")
-        audio_out = await voice_script.concat_audio(segments, reencode=True)
-    else:
+    has_markers = voice_script.has_markers(text)
+
+    async def synthesize_once(note_prefix: str = "") -> bytes:
+        """单版合成：带标记走分段路径，否则整段路径（长文按句分块直拼）。"""
+        if has_markers:
+            # 分段路径：片段参数独立合成，段间停顿插静音后 ffmpeg 拼接
+            speech_parts = [p for p in parts if isinstance(p, voice_script.SpeechPart)]
+            total = len(speech_parts)
+            segments: list[tuple[bytes, float]] = []
+            idx = 0
+            for p in parts:
+                if isinstance(p, voice_script.PausePart):
+                    if segments:
+                        audio, _ = segments[-1]
+                        segments[-1] = (audio, p.seconds)
+                    continue
+                if not p.text.strip():
+                    continue
+                if total > 1:
+                    jm.update(job_id, note=f"{note_prefix}分段合成 {idx + 1}/{total}")
+                merged_model, seg_voice = model, p.params(defaults)["voice"]
+                if seg_voice != voice:  # 片段音色可能是另一个资产：单独解析克隆协议
+                    merged_model, seg_voice = voice_assets.resolve_tts_voice(provider, model, seg_voice)
+                params = p.params(defaults)
+                audio = await tts.synthesize(
+                    text=_adapt_tags_for(p.text, provider, merged_model),
+                    model=merged_model, voice=seg_voice,
+                    speed=float(params["speed"]), emotion=str(params["emotion"]),
+                    pitch=int(params["pitch"]), vol=float(params["vol"]),
+                )
+                segments.append((audio, 0.0))
+                idx += 1
+            jm.update(job_id, note=f"{note_prefix}拼接分段音频")
+            return await voice_script.concat_audio(segments, reencode=True)
         # 整段路径（兼容原有行为）：长文按句分段合成后 MP3 帧直拼
         chunks = split_text(_adapt_tags_for(text, provider, model))
         audio_out = b""
         total = len(chunks)
         for i, chunk in enumerate(chunks):
             if total > 1:
-                jm.update(job_id, note=f"分段合成 {i + 1}/{total}")
+                jm.update(job_id, note=f"{note_prefix}分段合成 {i + 1}/{total}")
             audio_out += await tts.synthesize(
                 text=chunk, model=model, voice=voice, speed=speed,
                 emotion=emotion, pitch=int(pitch), vol=vol,
             )
+        return audio_out
+
+    takes = max(1, min(6, int(takes or 1)))
+    if takes > 1:
+        # 多版本挑优：厂商同参合成的语调有随机性（问句升调实测约六成命中），
+        # 重掷 N 版按韵律评分保留最好的一版；评分失败（ffmpeg 缺失等）回退第 1 版
+        is_question = voice_script.strip_markers(text).rstrip().endswith(("？", "?"))
+        takes_scored: list[tuple[bytes, float | None]] = []
+        for i in range(takes):
+            audio = await synthesize_once(f"多版本 {i + 1}/{takes}·")
+            s = prosody.score(audio, is_question)
+            takes_scored.append((audio, s))
+            jm.update(job_id, note=f"多版本 {i + 1}/{takes}：{prosody.describe(s, is_question)}")
+        best_idx = max(range(takes),
+                       key=lambda i: (takes_scored[i][1] is not None, takes_scored[i][1] or 0.0))
+        audio_out = takes_scored[best_idx][0]
+        summary = "/".join(prosody.describe(s, is_question) for _, s in takes_scored)
+        jm.update(job_id, note=f"挑优：选第 {best_idx + 1} 版（各版 {summary}）")
+    else:
+        audio_out = await synthesize_once()
+
     jm.update(job_id, status="downloading")
     # 台词写入文件名：下游（素材清单/分镜 bind/编号互证）按文件名提台词对号。
     # 标记与厂商内联标签 ((laughs)/(he2)) 都不进文件名，只留可朗读正文

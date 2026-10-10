@@ -238,7 +238,7 @@ def tool_update_scene(agent, args: dict) -> dict:
         for k in ("description", "prompt", "keyframe_prompt", "narration"):
             if args.get(k) is not None:
                 setattr(s, k, str(args[k])[:({"prompt": 8000, "narration": 5000, "keyframe_prompt": 2000}.get(k, 500))])
-        if args.get("gen_mode") in ("i2v", "t2v"):
+        if args.get("gen_mode") in ("i2v", "t2v", "first_last"):
             s.gen_mode = args["gen_mode"]
         if args.get("duration") is not None:
             new_duration = clamp_duration(int(args["duration"]), p.settings.video_model)

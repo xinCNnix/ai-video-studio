@@ -46,6 +46,7 @@ export interface UploadedAttachment {
   name: string;
   url: string;
   text?: string; // doc 类型：剧本正文（发送时内联进消息，模型直接读全文）
+  text_truncated?: boolean; // doc 类型：正文超上限被截断（第十回 14 镜被截成 9 镜的事故信号，必须明示）
   duration?: number | null; // audio 类型：服务端 ffprobe 的精确时长（秒），分镜对齐用
 }
 
@@ -99,8 +100,8 @@ export async function uploadAttachment(file: File, kind: UploadedAttachment["kin
     }
     throw new Error(detail || `上传失败 (${res.status})`);
   }
-  const data = (await res.json()) as { url: string; name: string; text?: string; duration?: number | null };
-  return { kind, name: data.name || file.name, url: data.url, text: data.text, duration: data.duration ?? null };
+  const data = (await res.json()) as { url: string; name: string; text?: string; text_truncated?: boolean; duration?: number | null };
+  return { kind, name: data.name || file.name, url: data.url, text: data.text, text_truncated: data.text_truncated, duration: data.duration ?? null };
 }
 
 export const api = {
@@ -254,6 +255,7 @@ export const api = {
     emotion: string;
     pitch?: number;
     vol?: number;
+    takes?: number;
   }) => request<{ job_id: string; job: Job }>("/api/voice/generate", { method: "POST", body: JSON.stringify(body) }),
   // 音色资产：设计音色的固化与复用
   listVoiceAssets: () => request<{ assets: VoiceAsset[] }>("/api/voice/assets"),

@@ -1,5 +1,13 @@
 # AI Video Studio —— AI 视频生成整合工作台 v2.0
 
+## 简介 / Introduction
+
+**中文** —— AI Video Studio 是一个 **Agent-First（智能体优先）** 的多模型 AI 视频生成工作台：投放任意格式的剧本与素材，系统自动完成剧本规整、分镜拆分与素材精确绑定，经人工确认后逐镜生成关键帧、配音与视频，最终用 ffmpeg 拼接导出成片。全流程由自研的 **Agent Harness 工程层**兜底：所有 LLM 输出都经过 schema 校验信封与自动修复，任意阶段崩溃可断点续跑，进度经 SSE 实时推送。无数据库依赖，数据全部落本地文件，API Key 以 AES-256-GCM 加密存储。
+
+**English** — AI Video Studio is an **agent-first**, multi-model AI video generation workbench. Drop in a screenplay and assets in any format; the system automatically normalizes the script, splits it into shots, and precisely binds reference images/audio to each shot. After human review, it generates keyframes, voice-over and video shot by shot, then assembles the final cut with ffmpeg. The entire pipeline is backstopped by a custom **Agent Harness** engineering layer: every LLM output passes through schema-validated envelopes with auto-repair, any crashed stage resumes from checkpoints, and progress streams to the frontend over SSE. No database is required — all data lives in local files, and API keys are encrypted at rest with AES-256-GCM.
+
+---
+
 > 定位：**Agent-First 的多模型视频生成工作台**。
 > Studio 以 Agent/流水线为主控：投放任意格式剧本 → 自动拆分镜 → 精确分配参考图/参考音频 → 确认后逐镜生成 → 拼接成片。
 > 稳定性由 **Agent Harness 工程层**保证（模型不可信，骨架兜底），不依赖 prompt 和模型自觉。
@@ -85,6 +93,9 @@ frontend/
 2. **Studio**：投放剧本/素材（粘贴文本或拖入 md/txt/图/音）→ 启动流水线 →
    看板实时显示阶段进度（SSE）→ review 面板确认分镜与素材分配（歧义素材逐项指派）→
    确认后逐镜生成（关键帧→配音→视频，失败自动重试）→ 导出成片。
+   逐镜执行剧本的**外层格式规范**见 [docs/剧本格式规范.md](docs/剧本格式规范.md)
+   （镜头标题/时长/素材绑定表/编号规则；镜内正文遵循 H3 标准）——照规范生成的
+   剧本走零 LLM 确定性路径，素材按表精确绑定。
 3. **Agent 控制台**（Studio 左栏）：粘贴剧本自动进流水线；"继续生成"推进；也可对话改单镜 Prompt/时长/素材。
 4. **独立工具页**（Prompt/图片/语音/视频）：保持 v1 用法不变。
 

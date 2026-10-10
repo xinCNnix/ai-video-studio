@@ -36,7 +36,8 @@ interface StudioV2State {
   addScene: (index?: number) => Promise<void>;
   deleteScene: (sceneId: string) => Promise<void>;
   moveScene: (sceneId: string, dir: -1 | 1) => Promise<void>;
-  bindMaterial: (sceneId: string, kind: MaterialKind, materialId: string) => Promise<void>;
+  /** role 仅图片绑定使用：reference（默认）/first_frame/last_frame（首尾帧模式） */
+  bindMaterial: (sceneId: string, kind: MaterialKind, materialId: string, role?: "reference" | "first_frame" | "last_frame") => Promise<void>;
   unbindMaterial: (sceneId: string, kind: MaterialKind, materialId: string) => Promise<void>;
   /** 素材池同类内移位（图N↔图N±1），修正 storyboard 的 <Image N> 上传顺序对齐 */
   moveMaterial: (materialId: string, dir: -1 | 1) => Promise<void>;
@@ -238,12 +239,12 @@ export const useStudioV2Store = create<StudioV2State>()((set, get) => {
       );
     },
 
-    bindMaterial: async (sceneId, kind, materialId) => {
+    bindMaterial: async (sceneId, kind, materialId, role) => {
       await get().command(
-        (p) => p2.bindMaterial(p.id, { scene_id: sceneId, kind, material_id: materialId, base_version: p.version }),
+        (p) => p2.bindMaterial(p.id, { scene_id: sceneId, kind, material_id: materialId, ...(role ? { role } : {}), base_version: p.version }),
         (fresh) =>
           fresh.scenes.some((s) => s.id === sceneId)
-            ? p2.bindMaterial(fresh.id, { scene_id: sceneId, kind, material_id: materialId, base_version: fresh.version })
+            ? p2.bindMaterial(fresh.id, { scene_id: sceneId, kind, material_id: materialId, ...(role ? { role } : {}), base_version: fresh.version })
             : null,
       );
     },

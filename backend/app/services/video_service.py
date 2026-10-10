@@ -1,5 +1,6 @@
 """视频生成任务执行服务：提交 -> 轮询 -> 下载。"""
 import asyncio
+import random
 import re
 
 from ..config import settings
@@ -44,13 +45,35 @@ def reference_tag_error(model: str, prompt: str, images: list, videos: list,
     return None
 
 
+def resolve_seed(provider: str, model: str, options: dict | None) -> int | None:
+    """决定本次提交实际使用的 seed（仅 AutoDL 支持 seed 透传的工作流返回数值）。
+
+    显式提供数值 seed 时原样返回（同 seed + 同参数可复现），否则随机——云端
+    工作流的 seed 固化在工作流 JSON 里，不传则同参数重提产出逐帧相同视频。
+    返回 None 表示该模型没有 seed 概念（其他厂商 / 契约 extra_fields 不含
+    seed），job 元数据不记录。返回值必须由调用方同时写入 options 下发，
+    autodl 适配器的随机化只兜底未走本函数的调用路径。
+    """
+    if provider != "autodl":
+        return None
+    spec = settings.AUTODL_WORKFLOW_SPECS.get(model) or {}
+    if "seed" not in (spec.get("extra_fields") or []):
+        return None
+    try:
+        return int((options or {}).get("seed"))
+    except (TypeError, ValueError):
+        return random.randint(0, 2**31 - 1)
+
+
 def autodl_contract_error(model: str, mode: str, images: list, videos: list, audios: list,
-                          prompt: str | None = None) -> str | None:
+                          prompt: str | None = None, last_images: list | None = None) -> str | None:
     """AutoDL 工作流入参契约校验（settings.AUTODL_WORKFLOW_SPECS 为单一事实来源）。
 
     返回中文错误信息，None 表示通过。非 AutoDL 模型（无契约）直接通过。
     在建任务/提交前调用，避免请求打到 AutoDL 才被工作流报错。
-    契约数据已与 AutoDL 官方 input_rules 逐一核对（2026-09-10）。
+    契约数据已与 AutoDL 官方 input_rules 逐一核对（首尾帧工作流 2026-10-01 复核）。
+    last_images 仅首尾帧契约（image_layout=first_last）需要：两帧均必填，
+    缺尾帧的请求会被 AutoDL 拒收，这里提前拦截给出可操作的提示。
     """
     spec = settings.AUTODL_WORKFLOW_SPECS.get(model)
     if not spec:
@@ -60,6 +83,8 @@ def autodl_contract_error(model: str, mode: str, images: list, videos: list, aud
     if mode not in spec["modes"]:
         allowed = "/".join(_MODE_LABELS.get(m, m) for m in spec["modes"])
         return f"该工作流不支持{_MODE_LABELS.get(mode, mode)}模式，仅支持：{allowed}"
+    if spec.get("image_layout") == "first_last" and not (last_images or []):
+        return "该工作流为首尾帧工作流，必须同时上传首帧与尾帧图片（当前缺少尾帧）"
     need = int(spec.get("min_images") or 0)
     if len(images or []) < need:
         return f"该工作流必须携带至少 {need} 张参考图（仅传音频/视频或纯文本会被工作流拒绝）"

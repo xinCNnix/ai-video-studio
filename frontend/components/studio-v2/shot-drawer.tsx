@@ -128,18 +128,23 @@ export function ShotDrawer() {
               className="w-full accent-primary"
             />
           </label>
-          <div className="flex items-end gap-1.5 pb-1">
-            {(["i2v", "t2v"] as const).map((m) => (
+          <div className="flex flex-wrap items-end gap-1 pb-1">
+            {([
+              { m: "i2v" as const, label: "图生", tip: "图生视频：关键帧/参考图生成（默认）" },
+              { m: "t2v" as const, label: "文生", tip: "文生视频：纯 Prompt 生成" },
+              { m: "first_last" as const, label: "首尾帧", tip: "首尾帧：首帧+尾帧约束生成（本镜不传参考素材；项目模型不支持时本镜自动改用首尾帧模型）" },
+            ]).map(({ m, label, tip }) => (
               <button
                 key={m}
                 type="button"
+                title={tip}
                 onClick={() => edit("gen_mode", m)}
                 className={cn(
-                  "cursor-pointer rounded-md px-2.5 py-1 text-[11px]",
+                  "cursor-pointer rounded-md px-2 py-1 text-[11px]",
                   draft.gen_mode === m ? "bg-primary/20 text-primary" : "bg-secondary/60 text-muted-foreground",
                 )}
               >
-                {m === "i2v" ? "图生视频" : "文生视频"}
+                {label}
               </button>
             ))}
           </div>
@@ -177,10 +182,31 @@ export function ShotDrawer() {
         </div>
         {scene.error && <div className="rounded-lg bg-red-500/10 px-3 py-2 text-[11px] text-red-300">{scene.error}</div>}
 
+        {/* 首尾帧模式：就绪度提示（缺什么在提交前可见） */}
+        {draft.gen_mode === "first_last" && (() => {
+          const firstOk = !!scene.assets.keyframe || boundImages.some((x) => x.binding.role === "first_frame");
+          const lastOk = boundImages.some((x) => x.binding.role === "last_frame");
+          const refBound = boundImages.some((x) => x.binding.role === "reference");
+          return (
+            <div className="space-y-1 rounded-lg border border-border bg-secondary/30 px-2.5 py-2 text-[10px] leading-relaxed">
+              <div className={firstOk ? "text-emerald-300" : "text-amber-300"}>
+                {firstOk ? "✓ 首帧就绪（关键帧或「首帧」绑定）" : "△ 缺首帧：点上方「生成首帧」，或在素材池选一张图「设为首帧」"}
+              </div>
+              <div className={lastOk ? "text-emerald-300" : "text-amber-300"}>
+                {lastOk ? "✓ 尾帧就绪" : "△ 缺尾帧：在素材池选一张图「设为尾帧」"}
+              </div>
+              {refBound && <div className="text-red-300">✕ 首尾帧镜不能绑参考图（互斥）：请解绑或改回「图生」</div>}
+              <div className="text-muted-foreground">
+                首尾帧镜不随请求传参考图/音频（模型自生成音效，配音导出时整轨替换）；项目模型不支持首尾帧时，本镜自动改用支持的工作流。
+              </div>
+            </div>
+          );
+        })()}
+
         {/* 素材绑定：缩略图 + 上传序号 + 本镜 <Picture k> 位置——生成前核对对错图的地方 */}
         <section className="space-y-1.5">
           <div className="flex items-center gap-2">
-            <div className="text-xs font-medium">参考素材</div>
+            <div className="text-xs font-medium">{draft.gen_mode === "first_last" ? "首尾帧绑定" : "参考素材"}</div>
             <button
               type="button"
               onClick={() => setPicking((v) => !v)}
@@ -210,9 +236,12 @@ export function ShotDrawer() {
                   >
                     P{k + 1}
                   </span>
-                  {binding.role === "first_frame" && (
-                    <span className="absolute bottom-0.5 left-0.5 rounded bg-black/70 px-1 text-[9px] leading-4 text-white">首帧</span>
-                  )}
+                      {binding.role === "first_frame" && (
+                        <span className="absolute bottom-0.5 left-0.5 rounded bg-black/70 px-1 text-[9px] leading-4 text-white">首帧</span>
+                      )}
+                      {binding.role === "last_frame" && (
+                        <span className="absolute bottom-0.5 left-0.5 rounded bg-black/70 px-1 text-[9px] leading-4 text-white">尾帧</span>
+                      )}
                   <button
                     type="button"
                     onClick={() => void unbindMaterial(scene.id, "image", material!.id)}
@@ -270,6 +299,55 @@ export function ShotDrawer() {
               )}
               {pickableMats.map((m) => {
                 const bound = boundIds.has(m.id);
+                // 首尾帧模式下的图片：绑定为「首帧」或「尾帧」角色（已绑的先解绑再换角色）
+                if (draft.gen_mode === "first_last" && m.kind === "image") {
+                  const roleBound = (r: string) =>
+                    scene.binding.images.some((b) => b.material_id === m.id && b.role === r);
+                  const rebind = async (role: "first_frame" | "last_frame") => {
+                    if (bound) await unbindMaterial(scene.id, "image", m.id);
+                    await bindMaterial(scene.id, m.kind, m.id, role);
+                  };
+                  return (
+                    <div
+                      key={m.id}
+                      className="flex w-full items-center gap-2 rounded-md px-1.5 py-1 text-[10px] transition-colors hover:bg-secondary/60"
+                      title="把这张图设为本镜的首帧/尾帧"
+                    >
+                      {/* eslint-disable-next-line @next/next/no-img-element */}
+                      <img src={fileUrl(m.url)} alt="" className="size-8 shrink-0 rounded object-cover" />
+                      <span className="font-semibold text-primary">{orderLabel("image", orderOf.get(m.id))}</span>
+                      <span className="min-w-0 flex-1 truncate text-muted-foreground">{displayFilename(m.filename)}</span>
+                      <span className="flex shrink-0 gap-1">
+                        <button
+                          type="button"
+                          disabled={roleBound("first_frame")}
+                          onClick={() => void rebind("first_frame")}
+                          className={cn(
+                            "rounded px-1.5 py-0.5",
+                            roleBound("first_frame")
+                              ? "cursor-not-allowed bg-primary/20 text-primary"
+                              : "cursor-pointer border border-border text-foreground/80 hover:bg-secondary/60",
+                          )}
+                        >
+                          {roleBound("first_frame") ? "已设首帧" : "设为首帧"}
+                        </button>
+                        <button
+                          type="button"
+                          disabled={roleBound("last_frame")}
+                          onClick={() => void rebind("last_frame")}
+                          className={cn(
+                            "rounded px-1.5 py-0.5",
+                            roleBound("last_frame")
+                              ? "cursor-not-allowed bg-primary/20 text-primary"
+                              : "cursor-pointer border border-border text-foreground/80 hover:bg-secondary/60",
+                          )}
+                        >
+                          {roleBound("last_frame") ? "已设尾帧" : "设为尾帧"}
+                        </button>
+                      </span>
+                    </div>
+                  );
+                }
                 return (
                   <button
                     key={m.id}

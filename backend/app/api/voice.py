@@ -29,6 +29,7 @@ class VoiceRequest(BaseModel):
     emotion: str = "neutral"
     pitch: int = 0    # 音调（MiniMax 半音，-12~12）
     vol: float = 1.0  # 音量（1~10，1 为常规音量）
+    takes: int = Field(default=1, ge=1, le=6)  # 多版本挑优：重掷 N 版按韵律评分取最优
 
 
 @router.post("/generate")
@@ -38,7 +39,7 @@ async def generate(req: VoiceRequest):
     params = {
         "text": req.text[:120], "voice": req.voice, "speed": req.speed,
         "emotion": req.emotion, "model": req.model,
-        "pitch": req.pitch, "vol": req.vol,
+        "pitch": req.pitch, "vol": req.vol, "takes": req.takes,
     }
     # 记录实际将使用的凭据（与 run_voice_job 内 get_tts 的解析一致），前端历史据此显示用的哪把 Key
     cred_label = registry.resolve_credential_label(req.credential_id, req.provider)
@@ -58,6 +59,7 @@ async def generate(req: VoiceRequest):
             emotion=req.emotion,
             pitch=req.pitch,
             vol=req.vol,
+            takes=req.takes,
         ),
     )
     return {"job_id": job["id"], "job": job}
@@ -213,4 +215,10 @@ async def get_asset_sample(asset_id: str):
     path = voice_assets.SAMPLES_DIR / asset["sample"]
     if not path.exists():
         raise HTTPException(status_code=404, detail="样本文件缺失")
-    return FileResponse(path, media_type=file_service.guess_mime(path), filename=f"{asset['name']}{path.suffix}")
+    # inline：attachment 会让 Chromium 挂起 <audio> 播放流（试听样本点播不出声）
+    return FileResponse(
+        path,
+        media_type=file_service.guess_mime(path),
+        filename=f"{asset['name']}{path.suffix}",
+        content_disposition_type="inline",
+    )

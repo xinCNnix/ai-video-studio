@@ -27,7 +27,7 @@ export default function ImagePage() {
   const setPendingVideo = useAppStore((s) => s.setPendingVideo);
   const setPendingStudio = useAppStore((s) => s.setPendingStudio);
 
-  const [modelId, setModelIdRaw] = useState(() => loadModelPref("image"));
+  const [modelId, setModelIdRaw] = useState("");
   const setModelId = (id: string) => {
     setModelIdRaw(id);
     saveModelPref("image", id);
@@ -53,6 +53,9 @@ export default function ImagePage() {
   };
 
   useEffect(() => {
+    // 记忆的模型偏好须挂载后读 localStorage：服务端首帧没有 window，
+    // 放进 useState 初始化器会让 SSR 与水合的文本不一致（Hydration failed）
+    setModelIdRaw(loadModelPref("image"));
     void loadCatalog();
     void loadCredentials();
     // eslint-disable-next-line react-hooks/exhaustive-deps

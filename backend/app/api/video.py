@@ -57,7 +57,8 @@ async def generate(req: VideoRequest):
         raise HTTPException(status_code=400, detail="该模式需要提供参考素材（图片 / 视频 / 音频）")
     # AutoDL 工作流按契约校验（缺参考图 / 模式不支持 / Prompt 必填提前 400，而不是等云端报错）
     contract_error = video_service.autodl_contract_error(
-        req.model, mode, req.images, req.videos, req.audios, prompt=req.prompt
+        req.model, mode, req.images, req.videos, req.audios,
+        prompt=req.prompt, last_images=req.last_images,
     )
     if contract_error:
         raise HTTPException(status_code=400, detail=contract_error)
@@ -76,6 +77,12 @@ async def generate(req: VideoRequest):
     else:
         dmin, dmax = 1, 15
     duration = min(max(int(req.duration or 5), dmin), dmax)
+    # seed 建任务前一次性决定：同值写入 job 元数据与 options 下发，保证
+    # 「记录的 seed = 实际使用的 seed」；未显式提供时随机（抽卡），提供则尊重（复现）
+    options = dict(req.options or {})
+    seed = video_service.resolve_seed(req.provider, req.model, options)
+    if seed is not None:
+        options["seed"] = seed
     params = {
         "mode": mode,
         "prompt": req.prompt[:300],
@@ -84,6 +91,8 @@ async def generate(req: VideoRequest):
         "model": req.model,
         "refs": len(req.images) + len(req.videos) + len(req.audios),
     }
+    if seed is not None:
+        params["seed"] = seed
     # 记录实际将使用的凭据（与 run_video_job 内 get_video 的解析一致），前端历史据此显示用的哪把 Key
     cred_label = registry.resolve_credential_label(req.credential_id, req.provider)
     if cred_label:
@@ -105,7 +114,7 @@ async def generate(req: VideoRequest):
             last_images=req.last_images,
             videos=req.videos,
             audios=req.audios,
-            options=req.options or {},
+            options=options,
         ),
     )
     return {"job_id": job["id"], "job": job}

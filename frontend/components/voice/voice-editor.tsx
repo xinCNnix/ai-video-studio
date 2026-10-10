@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import { Label } from "@/components/ui/label";
@@ -55,6 +55,9 @@ export interface VoiceSidebarProps {
   /** 全局默认音量（1~10，1 为常规）；片段 [vol:x] 标记优先 */
   vol: number;
   onVolChange: (v: number) => void;
+  /** 多版本挑优：生成 N 版按韵律评分取最优（对抗 MiniMax 合成语调随机性） */
+  takes: number;
+  onTakesChange: (n: number) => void;
   emotion: string;
   onEmotionChange: (e: string) => void;
   assets: VoiceAsset[];
@@ -72,7 +75,11 @@ export interface VoiceSidebarProps {
  */
 export function VoiceSidebar(props: VoiceSidebarProps) {
   const catalog = useAppStore((s) => s.catalog);
-  const [recent, setRecent] = useState<string[]>(() => getRecent("voice"));
+  const [recent, setRecent] = useState<string[]>([]);
+  // 最近描述存于 localStorage：挂载后读，保证 SSR 与水合首帧一致（服务端无 window）
+  useEffect(() => {
+    setRecent(getRecent("voice"));
+  }, []);
   const isHiggs = isHiggsModel(props.modelId);
 
   // 音色设计模式的“最近描述”快选：只留自由文本描述，排除预置音色 ID 与资产 ID
@@ -371,9 +378,33 @@ export function VoiceSidebar(props: VoiceSidebarProps) {
               </SelectContent>
             </Select>
           </div>
+          <div className="space-y-1">
+            <Label
+              className="text-xs"
+              title="生成 N 版后自动按韵律评分挑最好的一版：问句看句尾升幅，陈述句看语调起伏——对抗 MiniMax 同参合成的语调随机性"
+            >
+              挑优版本
+            </Label>
+            <Select
+              value={String(props.takes)}
+              onValueChange={(v) => props.onTakesChange(Number(v))}
+            >
+              <SelectTrigger className="h-8 text-xs">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {[1, 2, 3, 4, 5, 6].map((n) => (
+                  <SelectItem key={n} value={String(n)}>
+                    {n === 1 ? "1 版（关）" : `${n} 版`}
+                  </SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
         </div>
         <p className="text-[10px] leading-relaxed text-muted-foreground/70">
           以上为全局默认：MiniMax 精确生效，小米 / Higgs 自动就近映射。选中片段要单独设置时，用台词工具条加标记。
+          挑优版本 &gt; 1 时生成多版自动评分留最优，耗时相应变长。
         </p>
       </div>
 

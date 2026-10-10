@@ -51,7 +51,7 @@ class PatchSceneRequest(BaseModel):
     keyframe_prompt: str | None = None
     narration: str | None = None
     duration: int | None = None
-    gen_mode: Literal["i2v", "t2v"] | None = None
+    gen_mode: Literal["i2v", "t2v", "first_last"] | None = None
 
 
 class AddSceneRequest(BaseModel):
@@ -70,7 +70,7 @@ class BindRequest(BaseModel):
     scene_id: str
     kind: Literal["image", "audio", "video"]
     material_id: str
-    role: Literal["reference", "first_frame"] | None = None
+    role: Literal["reference", "first_frame", "last_frame"] | None = None
 
 
 @router.get("")

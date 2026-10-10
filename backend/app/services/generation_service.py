@@ -66,6 +66,31 @@ def resolve_video_model(preferred: str | None = None) -> dict:
     return m or settings.VIDEO_MODELS[0]
 
 
+def resolve_scene_video_model(project: Project, scene: Scene) -> tuple[dict, str | None]:
+    """按分镜解析视频模型：首尾帧镜在项目模型不支持该模式时自动回退。
+
+    返回 (模型, 回退说明)。回退规则：同厂商优先，其次目录内任一支持首尾帧的
+    模型（目录顺序确定，行为可预期）；找不到回退模型时原样返回项目模型，
+    由 assemble_video_request 的契约闸门给出明确报错。其余模式不做回退——
+    参考生视频等行为与项目设置严格一致，避免悄悄换模型换计费。
+    """
+    base = resolve_video_model(project.settings.video_model)
+    if scene.gen_mode != "first_last" or "first_last" in (base.get("modes") or []):
+        return base, None
+    alt = next(
+        (m for m in settings.VIDEO_MODELS
+         if m.get("provider") == base.get("provider") and "first_last" in (m.get("modes") or [])),
+        None,
+    ) or next(
+        (m for m in settings.VIDEO_MODELS if "first_last" in (m.get("modes") or [])),
+        None,
+    )
+    if alt and alt["id"] != base["id"]:
+        return alt, (f"该镜为「首尾帧」模式，项目模型「{base['label']}」不支持，"
+                     f"本镜已自动改用「{alt['label']}」生成（其余分镜不受影响）")
+    return base, None
+
+
 def _has_xiaomi_key() -> bool:
     return any(
         k.get("provider") == "xiaomi" or "xiaomimimo" in (k.get("base_url") or "").lower()
@@ -166,19 +191,24 @@ def fit_duration_to_audios(total_seconds: float, old: int, model_id: str | None)
 
 
 def scene_material_urls(scene: Scene, materials: dict[str, Material]) -> dict:
-    """把绑定关系解析成 URL 清单（关键帧=生成首帧或 first_frame 绑定素材）。"""
+    """把绑定关系解析成 URL 清单（关键帧=生成首帧或 first_frame 绑定素材，
+    尾帧=last_frame 绑定素材——仅首尾帧模式使用）。"""
     ref_images: list[str] = []
     first_frame: str | None = scene.assets.keyframe
+    last_frame: str | None = None
     for b in scene.binding.images:
         m = materials.get(b.material_id)
         if not m or not m.url:
             continue
         if b.role == "first_frame":
             first_frame = m.url
+        elif b.role == "last_frame":
+            last_frame = m.url
         else:
             ref_images.append(m.url)
     return {
         "first_frame": first_frame,
+        "last_frame": last_frame,
         "ref_images": ref_images,
         "ref_audios": [materials[x].url for x in scene.binding.audios
                        if x in materials and materials[x].url],
@@ -204,6 +234,8 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
     all_audios = urls["ref_audios"]
     unique_audios, dupe_audios = material_match.dedupe_same_text_audios(all_audios)
     notes: list[str] = []
+    if scene.gen_mode != "first_last" and urls.get("last_frame"):
+        notes.append("1 张「尾帧」绑定在当前生成模式下不生效（仅首尾帧模式使用）")
     if dupe_audios:
         notes.append(f"{len(dupe_audios)} 段同台词重复音频未传入（同台词只传一段，多传会把同一句烧两遍）")
     ref_audios = material_match.sort_audios_by_prompt(unique_audios, scene.prompt, scene.narration)
@@ -214,7 +246,7 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
     # 要求台词必须引用真实传入的音频——配音作为 <Audio 1> 传入，否则悬空标签被闸门拦截，
     # 模型也会凭 Audio Timeline 的台词引号自行编造语音。已绑用户音频时以绑定的为准
     # （导出侧 assets.voice 整轨替换音轨，不会与模型烧录的同一句叠放）
-    if scene.assets.voice and not ref_audios:
+    if scene.assets.voice and not ref_audios and scene.gen_mode != "first_last":
         ref_audios = [scene.assets.voice]
 
     # 台词时长防线（纯函数）：已知时长的绑定音频总时长超过镜头时长即拦截。
@@ -230,8 +262,27 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
         )
 
     keyframe = urls["first_frame"]
+    last_frame = urls.get("last_frame")
     has_refs = bool(ref_images or ref_videos or ref_audios)
-    if scene.gen_mode == "i2v":
+    last_images: list[str] = []
+    if scene.gen_mode == "first_last":
+        # 首尾帧镜：首帧=关键帧/first_frame 绑定，尾帧=last_frame 绑定；
+        # 不传任何参考素材（H3 官方首尾帧与参考互斥，AutoDL 首尾帧工作流也无参考入参）。
+        # 配音不随请求传入（FLF 模型自带音频生成），导出时 assets.voice 整轨替换
+        if not keyframe:
+            return {"contract_error": "首尾帧镜缺少首帧：请先生成关键帧，或绑定一张角色为「首帧」的图"}
+        if not last_frame:
+            return {"contract_error": "首尾帧镜缺少尾帧：请绑定一张角色为「尾帧」的图（素材池选图时设为尾帧）"}
+        if ref_images or ref_videos:
+            return {"contract_error": "首尾帧镜不能绑定参考图/视频（首尾帧与参考素材互斥）：请解绑参考素材或改回图生模式"}
+        if ref_audios:
+            # 台词时长闸门已按绑定音频校准过；这里只说明不随请求传入的事实
+            notes.append(f"{len(ref_audios)} 段绑定音频未随首尾帧请求传入（首尾帧与参考素材互斥，模型自行生成音效；配音导出时整轨替换）")
+            ref_audios = []
+        images = [keyframe]
+        last_images = [last_frame]
+        mode = "first_last"
+    elif scene.gen_mode == "i2v":
         if keyframe:
             images = [keyframe, *ref_images]
             mode = "reference" if has_refs else "image"
@@ -248,7 +299,12 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
     prompt = scene.prompt
     tag_error = ""
     audio_tags = material_match.audio_tags_in_order(prompt)
-    if audio_tags and not ref_audios:
+    if audio_tags and mode == "first_last":
+        tag_error = (
+            f"Prompt 引用了 {'/'.join(f'<Audio {t}>' for t in audio_tags)} 标签，但首尾帧模式不随请求传参考音频"
+            "（模型自行生成音效，配音在导出时整轨替换）：请去掉音频标签或改回参考模式"
+        )
+    elif audio_tags and not ref_audios:
         tag_error = (
             f"Prompt 引用了 {'/'.join(f'<Audio {t}>' for t in audio_tags)} 标签，但本镜没有绑定音频："
             "悬空标签会让模型自行编造语音——请绑定音频或去掉 Prompt 里的音频标签"
@@ -263,19 +319,31 @@ def assemble_video_request(scene: Scene, materials: dict[str, Material], vmodel:
         if tag_note:
             notes.append(tag_note)
     if not tag_error:
-        for label, passed in (("Picture", images), ("Video", ref_videos)):
-            nums = [int(n) for n in re.findall(rf"<{label}\s+(\d+)>", prompt)]
-            if nums and max(nums) > len(passed):
-                tag_error = (
-                    f"Prompt 引用了 <{label} {max(nums)}> 标签，但本镜只传入 {len(passed)} 个参考"
-                    f"{'图' if label == 'Picture' else '视频'}：悬空标签会让模型找不到指定素材"
-                )
-                break
+        if mode == "first_last":
+            for label in ("Picture", "Video"):
+                nums = [int(n) for n in re.findall(rf"<{label}\s+(\d+)>", prompt)]
+                if nums:
+                    tag_error = (
+                        f"Prompt 引用了 <{label} {max(nums)}> 标签，但首尾帧模式不传编号参考素材"
+                        "（首尾帧以画面直接约束）：请去掉该标签或改回参考模式"
+                    )
+                    break
+        else:
+            for label, passed in (("Picture", images), ("Video", ref_videos)):
+                nums = [int(n) for n in re.findall(rf"<{label}\s+(\d+)>", prompt)]
+                if nums and max(nums) > len(passed):
+                    tag_error = (
+                        f"Prompt 引用了 <{label} {max(nums)}> 标签，但本镜只传入 {len(passed)} 个参考"
+                        f"{'图' if label == 'Picture' else '视频'}：悬空标签会让模型找不到指定素材"
+                    )
+                    break
     contract_error = tag_error or audio_fit_error or video_service.autodl_contract_error(
-        vmodel["id"], mode, images, ref_videos, ref_audios, prompt=prompt
+        vmodel["id"], mode, images, ref_videos, ref_audios, prompt=prompt,
+        last_images=last_images,
     )
     return {
-        "mode": mode, "images": images, "ref_videos": ref_videos, "ref_audios": ref_audios,
+        "mode": mode, "images": images, "last_images": last_images,
+        "ref_videos": ref_videos, "ref_audios": ref_audios,
         "prompt": prompt, "contract_error": contract_error, "notes": notes,
         "fingerprint": prompt_fingerprint(scene.prompt),
     }
@@ -631,7 +699,7 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
             trace.log("tool_result", tool="submit_video", ok=False, scene_id=scene_id, error=fit_error)
         return {"ok": False, "error": fit_error}
 
-    vmodel = resolve_video_model(project.settings.video_model)
+    vmodel, model_note = resolve_scene_video_model(project, scene)
     materials = {m.id: m for m in project.materials}
 
     # 显式时长优先于分镜时长，但不允许低于台词总时长（闸门刚把 scene.duration 校准到位）
@@ -661,10 +729,14 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
         return {"ok": False, "error": f"当前视频模型「{vmodel['label']}」：{req['contract_error']}"}
 
     fingerprint = req["fingerprint"]
+    # seed 建任务前一次性决定：同值写入 job 元数据与 options 下发，保证
+    # 「记录的 seed = 实际使用的 seed」（适配器随机化仅兜底未走本函数的路径）
+    seed = video_service.resolve_seed(vmodel["provider"], vmodel["id"], None)
     job = job_manager.create("video", vmodel["provider"], vmodel["id"], {
         "mode": req["mode"], "prompt": req["prompt"][:300], "duration": duration,
         "aspect_ratio": project.aspect_ratio, "scene_id": scene_id, "project_id": project_id,
         "prompt_fingerprint": fingerprint,
+        **({"seed": seed} if seed is not None else {}),
     })
 
     # 原子占位：全部拦截判定与 video_job 指派在同一把项目锁内完成，并发提交
@@ -726,8 +798,8 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
             job_id=job["id"], provider=vmodel["provider"], model=vmodel["id"],
             credential_id=None, mode=req["mode"], prompt=req["prompt"],
             duration=duration, aspect_ratio=project.aspect_ratio, resolution=project.settings.resolution or None,
-            images=req["images"], last_images=[], videos=req["ref_videos"], audios=req["ref_audios"],
-            options={},
+            images=req["images"], last_images=req.get("last_images") or [], videos=req["ref_videos"], audios=req["ref_audios"],
+            options={"seed": seed} if seed is not None else {},
         ),
     )
     if trace:
@@ -739,6 +811,8 @@ async def submit_scene_video(project_id: str, scene_id: str, *, wanted_duration:
     asyncio.get_running_loop().create_task(_writeback_scene_video(project_id, scene_id, job["id"], fingerprint, trace))
     notes = "; ".join(req["notes"])
     note = "后台生成中" + (f"；{notes}" if notes else "")
+    if model_note:
+        note += f"；{model_note}"
     if fit_note:
         note += f"；{fit_note}"
     if wanted_duration and wanted_duration != duration:

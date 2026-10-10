@@ -10,6 +10,7 @@ plan 一锅端全文 → M3 思考烧尽 max_tokens、正文三连空。
 import json
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 BACKEND = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(BACKEND))
@@ -227,6 +228,54 @@ def main() -> int:
     check("「镜头N」编号入去重闸门：同号两拍只留全文拍",
           len(kept_shot) == 1 and kept_shot[0]["source_text"].startswith("## 镜头02")
           and len(dropped_shot) == 1, f"kept={[k['title'] for k in kept_shot]}")
+
+    # ---------------- 6. **加粗段名** markdown 六段式成稿（2026-10-04 聊皮肤13集事故） ----------------
+    # 稿式：## Shot NN｜标题 + **Duration:** 4.00 s（冒号在加粗内部）+ **References:** 同行声明
+    # + **subject_definitions:** 正文同行。旧识别只认「裸段名独占行」→ 0 命中 →
+    # normalize 走 LLM 分块把 10 镜拆成 26 拍（保真闸门拿错误基准越守越错），
+    # 分块包装头【剧本片段 i/N】再污染 1 拍致直录全灭，13 窗慢路径 1 小时+
+    bold_frags = []
+    for no, (t, dur, imgs) in enumerate([("发现", 4, 2), ("确认", 5, 2), ("解释", 6, 3)], 1):
+        refs = "; ".join(f"`<Picture {k}>` ← Image0{k}_K{no:02d}A at 0.00" for k in range(1, imgs + 1))
+        refs += "; `<Audio 1>` ← Audio01 (pending)."
+        bold_frags.append(
+            f"## Shot {no:02d}｜{t}\n\n"
+            f"**Duration:** {dur}.00 s. **Global:** 00:00.00—00:0{dur}.00.\n\n"
+            f"**References:** {refs}\n\n"
+            f"**subject_definitions:** `<Subject 1>` is Xiao Mo. `<Subject 2>` is A in shot {no}.\n\n"
+            f"**summary:** Shot {no} summary line.\n\n"
+            f"**detailed_description:** [Shot {no}] content with movement." + " Detail." * 10 + "\n\n"
+            f"**overall_soundscape:** Soft.\n\n**non_diegetic_music:** N/A.\n"
+        )
+    bold_src = ("# 第N集\n\n## 全局参考图总表\n\nImage01：小墨。\n\n---\n\n"
+                + "\n".join(bold_frags) + "\n## 交付核对\n\n28 张关键帧。\n")
+    bh3 = stages.detect_h3_prompt_boundaries(bold_src)
+    check("加粗六段式成稿识别 3 镜（原 0 命中）", len(bh3) == 3, f"{len(bh3)}")
+    check("镜头标题从「## Shot N｜标题」提取", [t for _, t in bh3] == ["发现", "确认", "解释"],
+          str([t for _, t in bh3]))
+    bb3 = stages._beats_from_headers(bold_src, bh3)
+    check("加粗式一镜一拍全 verbatim 且以镜头头开头",
+          len(bb3) == 3 and all(b["source_fidelity"] == "verbatim" for b in bb3)
+          and all(b["source_text"].startswith(f"## Shot {i + 1:02d}｜") for i, b in enumerate(bb3)))
+    check("References/Duration 声明留在拍内（bind 素材对号依据）",
+          all("References:" in b["source_text"] and "Duration:" in b["source_text"] for b in bb3))
+    check("上扩不跨镜：每拍 non_diegetic_music 属于自己、不含别镜标题",
+          all("non_diegetic_music" in b["source_text"] for b in bb3)
+          and "确认" not in bb3[0]["source_text"] and "发现" not in bb3[1]["source_text"])
+    check("加粗式 extract_h3_body 全部成功", all(stages.extract_h3_body(b["source_text"]) for b in bb3))
+    check("加粗 **Duration:**（冒号在加粗内）时长被解析",
+          [stages._DURATION_DECL_RE.search(b["source_text"]).group(1) for b in bb3] == ["4.00", "5.00", "6.00"])
+    img_ns, aud_ns, _ = stages._reference_tokens(bb3[0]["source_text"])
+    check("同行 References 声明解析（图 2 张 + 音 1 段）", img_ns == [1, 2] and aud_ns == [1], f"{img_ns} {aud_ns}")
+    fp = SimpleNamespace(materials=[SimpleNamespace(kind="image", id=f"m{i}") for i in range(5)]
+                         + [SimpleNamespace(kind="audio", id="a1")])
+    adopted = stages.adopt_verbatim_h3_shots(fp, bb3)
+    check("加粗式成稿直录全稿可用（零 LLM 路径）", adopted is not None and len(adopted) == 3)
+    if adopted:
+        check("直录时长逐镜正确（非默认 5）", [s["duration"] for s in adopted] == [4, 5, 6],
+              str([s["duration"] for s in adopted]))
+        check("直录 wants_images 按声明对号", [len(s["wants_images"]) for s in adopted] == [2, 2, 3],
+              str([len(s["wants_images"]) for s in adopted]))
 
     print(f"\n通过 {PASS} 项，失败 {FAIL} 项")
     return 1 if FAIL else 0

@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from ..config import settings
 
 MaterialKind = Literal["image", "audio", "video", "doc", "script"]
-ImageRole = Literal["reference", "first_frame"]
-GenMode = Literal["i2v", "t2v"]
+ImageRole = Literal["reference", "first_frame", "last_frame"]
+# first_last：按镜覆盖的首尾帧模式——首帧走关键帧/first_frame 绑定，尾帧走
+# last_frame 绑定；该镜不传参考图/音频（H3 首尾帧与参考素材互斥）
+GenMode = Literal["i2v", "t2v", "first_last"]
 SceneStatus = Literal["planned", "ready", "generating", "done", "failed"]
 PipelineStage = Literal["empty", "intake", "normalize", "plan", "bind", "review", "generate", "assemble"]
 PipelineState = Literal["idle", "running", "paused", "failed", "done"]
@@ -193,6 +195,8 @@ def check_invariants(p: Project) -> list[str]:
             violations.append(f"{label}: 参考视频列表存在重复素材")
         if sum(1 for x in b.images if x.role == "first_frame") > 1:
             violations.append(f"{label}: 首帧角色绑定多于一个")
+        if sum(1 for x in b.images if x.role == "last_frame") > 1:
+            violations.append(f"{label}: 尾帧角色绑定多于一个")
         missing = [mid for mid in [*img_ids, *b.audios, *b.videos] if mid not in material_ids]
         if missing:
             violations.append(f"{label}: 绑定了不存在的素材 {missing}")

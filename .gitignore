@@ -22,6 +22,10 @@ data/presets/*
 data/voices/*
 data/logs/*
 
+# 项目数据备份与本地会话产物（不入库）
+data/backups/
+.zcode/
+
 # 调试产物与历史快照
 backup/
 repro/

@@ -1,8 +1,9 @@
 /** 项目 v2 状态模型（与 backend/app/harness/state.py 对齐）。 */
 
 export type MaterialKind = "image" | "audio" | "video" | "doc" | "script";
-export type ImageRole = "reference" | "first_frame";
-export type GenMode = "i2v" | "t2v";
+export type ImageRole = "reference" | "first_frame" | "last_frame";
+/** first_last：按镜覆盖的首尾帧模式（首帧=关键帧/首帧绑定，尾帧=尾帧绑定，不传参考素材） */
+export type GenMode = "i2v" | "t2v" | "first_last";
 export type SceneStatus = "planned" | "ready" | "generating" | "done" | "failed";
 export type PipelineStage =
   | "empty" | "intake" | "normalize" | "plan" | "bind" | "review" | "generate" | "assemble";

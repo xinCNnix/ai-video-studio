@@ -142,6 +142,7 @@ export function AgentConsole() {
       for (const f of list) {
         const m = await uploadMaterial(f);
         if (m.kind === "doc") {
+          if (m.text_truncated) toast.error(`剧本「${m.filename}」超长被截断：分镜会缺尾，请拆分成多个文件分段发送`);
           docParts.push(m.text ? `剧本文档 ${m.filename} 全文：\n${m.text}` : `剧本文档 ${m.filename}：${m.url}（用 read_doc 读取全文）`);
         } else {
           mediaParts.push(`- ${m.kind === "image" ? "参考图" : m.kind === "audio" ? "配音" : "参考视频"}：${m.url}`);

@@ -17,7 +17,7 @@ export default function VideoPage() {
   const pendingVideo = useAppStore((s) => s.pendingVideo);
   const setPendingVideo = useAppStore((s) => s.setPendingVideo);
 
-  const [modelId, setModelIdRaw] = useState(() => loadModelPref("video"));
+  const [modelId, setModelIdRaw] = useState("");
   const setModelId = (id: string) => {
     setModelIdRaw(id);
     saveModelPref("video", id);
@@ -44,6 +44,9 @@ export default function VideoPage() {
   const modelLabel = modelInfo?.label ?? currentJob?.model ?? "";
 
   useEffect(() => {
+    // 记忆的模型偏好须挂载后读 localStorage：服务端首帧没有 window，
+    // 放进 useState 初始化器会让 SSR 与水合的文本不一致（Hydration failed）
+    setModelIdRaw(loadModelPref("video"));
     void loadCatalog();
     void loadCredentials();
     // eslint-disable-next-line react-hooks/exhaustive-deps

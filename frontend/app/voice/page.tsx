@@ -32,18 +32,19 @@ export default function VoicePage() {
   const loadDiscovered = useAppStore((s) => s.loadDiscovered);
   const setPendingVoice = useAppStore((s) => s.setPendingVoice);
 
-  const [modelId, setModelIdRaw] = useState(() => loadModelPref("tts"));
+  const [modelId, setModelIdRaw] = useState("");
   const setModelId = (id: string) => {
     setModelIdRaw(id);
     saveModelPref("tts", id);
   };
   const [text, setText] = useState("");
-  const [voice, setVoice] = useState(() => loadModelPref("voice"));
+  const [voice, setVoice] = useState("");
   const [speed, setSpeed] = useState(1.0);
   const [emotion, setEmotion] = useState("neutral");
   // 全局默认音调/音量（左栏滑杆；片段未加 [pitch:x]/[vol:x] 标记时生效）
   const [pitch, setPitch] = useState(0);
   const [vol, setVol] = useState(1);
+  const [takes, setTakes] = useState(1);
 
   // 模式是显式用户意图：点顶栏页签设定，换模型不重算（在设计模式切到 speech 模型
   // 被弹回配音的事故源）。仅反向同步：配音模式下手动选了 voicedesign /
@@ -73,6 +74,10 @@ export default function VoicePage() {
   }, []);
 
   useEffect(() => {
+    // 记忆的模型/音色须挂载后读 localStorage：服务端首帧没有 window，
+    // 放进 useState 初始化器会让 SSR 与水合的文本不一致（Hydration failed）
+    setModelIdRaw(loadModelPref("tts"));
+    setVoice(loadModelPref("voice"));
     void loadCatalog();
     void loadCredentials();
     void loadAssets();
@@ -264,6 +269,7 @@ export default function VoicePage() {
         emotion,
         pitch,
         vol,
+        takes,
       });
       const finalJob = await pollJob(job.id, (j) => setCurrentJob({ ...j }));
       if (finalJob.status === "completed") {
@@ -299,6 +305,8 @@ export default function VoicePage() {
         onPitchChange={setPitch}
         vol={vol}
         onVolChange={setVol}
+        takes={takes}
+        onTakesChange={setTakes}
         assets={assets}
         onDeleteAsset={(a) => void deleteAsset(a)}
         onUseAsset={(a) => commitVoice(a.id)}
@@ -373,7 +381,11 @@ export default function VoicePage() {
                   id: v.id,
                   label: v.label === v.id ? v.id : `${v.label}（${v.id}）`,
                 })),
-                ...assets.map((a) => ({ id: a.id, label: `${a.name}（资产）` })),
+                // catalog.tts_voices 经 discovered 接口已含全部音色资产，直接拼 assets
+                // 会让同一 voice_* 出现两次 → SelectItem key 冲突。只补 catalog 还没有的。
+                ...assets
+                  .filter((a) => !(catalog?.tts_voices ?? []).some((v) => v.id === a.id))
+                  .map((a) => ({ id: a.id, label: `${a.name}（资产）` })),
               ]}
             />
 

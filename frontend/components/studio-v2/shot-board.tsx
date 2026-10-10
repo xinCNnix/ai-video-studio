@@ -202,7 +202,7 @@ export function ShotBoard() {
                 <div className="truncate text-xs font-medium">{s.title}</div>
                 <div className="mt-1 flex items-center gap-1.5 text-[10px] text-muted-foreground">
                   <span>{s.duration}s</span>
-                  <span className="rounded bg-secondary/60 px-1">{s.gen_mode === "i2v" ? "图生" : "文生"}</span>
+                  <span className="rounded bg-secondary/60 px-1">{s.gen_mode === "i2v" ? "图生" : s.gen_mode === "t2v" ? "文生" : "首尾帧"}</span>
                   {boundImgs.length > 0 && (
                     // 绑定参考图小缩略图：看板上一眼核对每镜挂的图，不用点开抽屉
                     <span className="inline-flex items-center gap-0.5">

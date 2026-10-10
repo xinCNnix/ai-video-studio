@@ -37,9 +37,22 @@ def scene_gaps(scene: Scene, project_id: str = "") -> tuple[list[str], str | Non
     gaps: list[str] = []
     has_user_audio = bool(scene.binding.audios)
     has_ref_images = bool(scene.binding.images)
+    has_last_frame = any(b.role == "last_frame" for b in scene.binding.images)
     block: str | None = None
 
-    need_keyframe = scene.gen_mode == "i2v" and not scene.assets.keyframe and not has_ref_images
+    # 首尾帧镜：参考素材互斥提前阻塞（省一次注定失败的自动提交）；
+    # 尾帧只能由用户绑定（无生成器），缺失即阻塞交人工
+    if scene.gen_mode == "first_last":
+        if any(b.role == "reference" for b in scene.binding.images) or scene.binding.videos:
+            block = "首尾帧镜不能绑定参考图/视频（与参考素材互斥）：请解绑或改回图生模式"
+        elif not has_last_frame:
+            block = "首尾帧镜缺少尾帧：请在分镜素材绑定里选一张图设为「尾帧」"
+
+    # 首帧与 i2v 同源：关键帧生成 或 first_frame/参考图绑定（尾帧绑定不算首帧来源）
+    has_frame_source = bool(scene.assets.keyframe) or any(
+        b.role != "last_frame" for b in scene.binding.images
+    )
+    need_keyframe = scene.gen_mode in ("i2v", "first_last") and not has_frame_source
     if need_keyframe:
         if (scene.keyframe_prompt or scene.description).strip():
             gaps.append("keyframe")

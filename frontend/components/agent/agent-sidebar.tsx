@@ -224,6 +224,9 @@ export function AgentSidebar() {
           continue;
         }
         const att = await uploadAttachment(file, kind);
+        if (att.kind === "doc" && att.text_truncated) {
+          toast.error(`剧本「${att.name}」超长被截断：分镜会缺尾，请拆分成多个文件分段发送`);
+        }
         setAttachments((prev) => [...prev, att]);
       }
     } catch (err) {

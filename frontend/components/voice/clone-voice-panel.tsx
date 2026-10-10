@@ -3,7 +3,7 @@
 import { useEffect, useRef, useState } from "react";
 import { Check, Loader2, Mic, Pause, Play, RefreshCw, Trash2, UploadCloud } from "lucide-react";
 import { toast } from "sonner";
-import { api } from "@/lib/api";
+import { api, fileUrl } from "@/lib/api";
 import type { VoiceAsset } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/stores/app-store";
@@ -44,7 +44,9 @@ function CloneSampleRow({
   const [playing, setPlaying] = useState(false);
   const [time, setTime] = useState(0);
   const [duration, setDuration] = useState(0);
-  const src = asset.sample_url ?? "";
+  // sample_url 是后端相对路径（/api/...）：必须经 fileUrl 拼后端地址，否则请求
+  // 打到前端端口 404，试听样本点不出声（audio 报 MEDIA_ERR_SRC_NOT_SUPPORTED）
+  const src = fileUrl(asset.sample_url);
 
   // 面板内同一时间只播一条：别的是当前播放者时暂停自己
   useEffect(() => {

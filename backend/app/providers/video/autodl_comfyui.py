@@ -7,11 +7,14 @@
 不同工作流的入参要求不同（是否必传参考图、是否收音频等），统一由
 config.settings.AUTODL_WORKFLOW_SPECS 契约表描述：
 - 提交前按契约做最后防线校验（API 层已提前 400，这里兜底防止其他调用路径漏校验）；
-- 字段按契约过滤：参考图平铺为 ref_image_N（均无首帧语义）、音频仅在契约允许时
-  以 ref_audio_N 传入、options 只透传契约 extra_fields 声明的字段。
+- 字段按契约过滤：默认参考图平铺为 ref_image_N（均无首帧语义）；契约声明
+  image_layout="first_last" 的首尾帧工作流（如 minimax_h3_lightx2v）则把
+  images[0]/last_images[0] 映射为独立的 first_frame/last_frame 入参；
+  音频仅在契约允许时以 ref_audio_N 传入；options 只透传契约 extra_fields 声明的字段。
 """
 import base64
 import mimetypes
+import random
 from pathlib import Path
 
 import httpx
@@ -39,10 +42,13 @@ def _build_body(params: dict, spec: dict | None = None) -> dict:
     """构造提交请求体（纯函数，便于离线验证）。
 
     spec 为该工作流的契约（settings.AUTODL_WORKFLOW_SPECS 的一条，可为 None）：
-    - audios 仅在 spec["accepts_audios"] 为真时编码进 ref_audio_N；
-    - options 只透传 spec["extra_fields"] 白名单里的字段（AutoDL 严格校验，
-      多传未定义字段会报"存在未定义的参数"，prompt_optimizer 等厂商选项会被剔除）。
-    已验证的通用字段：prompt / duration / resolution / ref_image_N。
+- audios 仅在 spec["accepts_audios"] 为真时编码进 ref_audio_N；
+- 首尾帧工作流（spec["image_layout"] == "first_last"）把 images[0]/last_images[0]
+  编码为 first_frame/last_frame（两帧缺失由契约层提前拦截，这里只编码实际存在
+  的帧，绝不静默降级提交）；
+- options 只透传 spec["extra_fields"] 白名单里的字段（AutoDL 严格校验，
+  多传未定义字段会报"存在未定义的参数"，prompt_optimizer 等厂商选项会被剔除）。
+已验证的通用字段：prompt / duration / resolution / ref_image_N。
     """
     spec = spec or {}
     body: dict = {}
@@ -52,17 +58,30 @@ def _build_body(params: dict, spec: dict | None = None) -> dict:
         body["duration"] = int(params["duration"])
     if params.get("resolution") and params["resolution"] != "auto":
         res = str(params["resolution"])
-        # AutoDL 格式为 "768p横/768p竖/480p(1:1)" 等：按画幅自动补方向
-        if "横" not in res and "竖" not in res and "(1:1)" not in res:
-            if params.get("aspect_ratio") == "9:16":
-                res += "竖"
-            elif params.get("aspect_ratio") == "1:1":
-                res += "(1:1)"
-            else:
-                res += "横"
-        body["resolution"] = res
-    # 参考图按契约上限过滤（max_images=0 的纯文生工作流绝不携带 ref_image_N）
-    if spec.get("max_images") is None or spec.get("max_images") > 0:
+        # 契约声明 resolution_labels 的工作流（枚举标签带像素后缀，如 768p横(1376*768)）
+        # 按画幅取完整标签直接透传；命不中（如自定义档位）回退补方向后缀逻辑
+        labels = spec.get("resolution_labels") or {}
+        exact = (labels.get(res) or {}).get(str(params.get("aspect_ratio") or ""))
+        if exact:
+            body["resolution"] = exact
+        else:
+            # AutoDL 格式为 "768p横/768p竖/480p(1:1)" 等：按画幅自动补方向
+            if "横" not in res and "竖" not in res and "(1:1)" not in res:
+                if params.get("aspect_ratio") == "9:16":
+                    res += "竖"
+                elif params.get("aspect_ratio") == "1:1":
+                    res += "(1:1)"
+                else:
+                    res += "横"
+            body["resolution"] = res
+    # 参考图按契约布局编码：首尾帧工作流映射为 first_frame/last_frame 独立入参，
+    # 其余平铺为 ref_image_N（契约上限过滤，max_images=0 的纯文生工作流绝不携带）
+    if spec.get("image_layout") == "first_last":
+        if params.get("images"):
+            body["first_frame"] = _to_data_url(params["images"][0])
+        if params.get("last_images"):
+            body["last_frame"] = _to_data_url(params["last_images"][0])
+    elif spec.get("max_images") is None or spec.get("max_images") > 0:
         for i, path in enumerate(params.get("images") or []):
             body[f"ref_image_{i}"] = _to_data_url(path)
     if spec.get("accepts_audios", True):
@@ -73,6 +92,15 @@ def _build_body(params: dict, spec: dict | None = None) -> dict:
     for key, value in (params.get("options") or {}).items():
         if key in allowed:
             body[key] = value
+    # seed 随机化（抽卡的前提）：AutoDL 工作流的 seed 固化在云端工作流 JSON 里，
+    # 不传则每次都用同一个默认种子——同参数重提产出逐帧相同的视频。契约声明可传
+    # seed 的工作流，未显式提供（或提供了非数值）时注入随机种子；显式传数值则
+    # 尊重（同 seed 可复现）。与 comfy_local 的 seed/noise_seed 随机化同一约定。
+    if "seed" in allowed:
+        try:
+            body["seed"] = int(body.get("seed"))
+        except (TypeError, ValueError):
+            body["seed"] = random.randint(0, 2**31 - 1)
     return body
 
 
@@ -113,6 +141,10 @@ class AutoDLComfyUI(VideoProvider):
         if len(params.get("images") or []) < need:
             raise ProviderError(
                 f"工作流 {workflow_id} 必须携带至少 {need} 张参考图，当前请求未携带。"
+            )
+        if (spec or {}).get("image_layout") == "first_last" and not (params.get("last_images") or []):
+            raise ProviderError(
+                f"工作流 {workflow_id} 为首尾帧工作流，必须同时携带首帧与尾帧图片（当前缺少尾帧）。"
             )
         body = _build_body(params, spec)
         try:

@@ -82,7 +82,12 @@ export function IntakePanel() {
         const m = await uploadMaterial(f);
         if (m.kind === "doc" && m.text) {
           setScript((s) => (s ? `${s}\n\n${m.text}` : (m.text ?? "")));
-          toast.success(`已读取剧本「${m.filename}」`);
+          if (m.text_truncated) {
+            // 静默截断会把长稿砍尾后照常拆镜（第十回 14 镜拆成 9 镜），必须当场拦住用户
+            toast.error(`剧本「${m.filename}」超长被截断：只读到前 ${Math.floor((m.text.length) / 10000)} 万字。请拆分成多个文件分段追加投放，否则分镜会缺尾`);
+          } else {
+            toast.success(`已读取剧本「${m.filename}」`);
+          }
         } else {
           setMaterials((ms) => (ms.some((x) => x.url === m.url) ? ms : [...ms, { ...m }]));
         }

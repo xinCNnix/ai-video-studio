@@ -39,6 +39,7 @@ export function VideoHistory({
           const aspect = (job.params?.aspect_ratio as string) || "16:9";
           const duration = (job.params?.duration as number) || 5;
           const credential = (job.params?.credential as string) || "";
+          const seed = job.params?.seed as number | undefined;
           const selected = job.id === selectedId;
           return (
             <button
@@ -77,6 +78,14 @@ export function VideoHistory({
                       <span>·</span>
                       <span className="shrink-0 text-emerald-300/70" title={`本次使用的 Key：${credential}`}>
                         🔑{credential}
+                      </span>
+                    </>
+                  )}
+                  {seed != null && (
+                    <>
+                      <span>·</span>
+                      <span className="shrink-0" title="本次使用的随机种子：相同 seed + 相同参数可复现同样结果">
+                        🎲{seed}
                       </span>
                     </>
                   )}

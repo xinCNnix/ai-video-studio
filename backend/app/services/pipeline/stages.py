@@ -10,6 +10,7 @@
 import re
 from pathlib import Path
 
+from ...config import settings
 from ...harness.errors import FatalError, NeedsUserInputError
 from ...harness.state import (
     Character,
@@ -27,6 +28,8 @@ from .. import generation_service, material_match, project_store, prompt_timing,
 # ---------------- 常量 ----------------
 
 NORMALIZE_CHUNK_CHARS = 3500
+# 剧本正文上限：与上传预览（api/files.py）同一常量（见 config/settings.py 注释）
+MAX_SCRIPT_CHARS = settings.MAX_SCRIPT_CHARS
 PLAN_BATCHHint = 8  # 提示模型单批输出规模上限
 PLAN_MAX_BATCHES = 25  # 200 镜安全上限
 PLAN_GUARD_RETRIES = 2  # storyboard 保真闸门：镜数≠拍数时的纠错重规划次数
@@ -371,7 +374,7 @@ def run_intake(project_id: str, payload: dict, trace=None) -> dict:
         }
         if script_text and material_match.norm_tts_text(script_text[:4000]) not in existing_scripts:
             p.materials.append(Material(
-                id=new_material_id(), kind="script", text=script_text[:200000],
+                id=new_material_id(), kind="script", text=script_text[:MAX_SCRIPT_CHARS],
                 filename="inline_script.txt", url=None,
             ))
         for item in material_items:
@@ -402,7 +405,7 @@ def run_intake(project_id: str, payload: dict, trace=None) -> dict:
                 local = file_service.resolve_local(m.url)
                 if local and Path(local).exists():
                     try:
-                        m.text = Path(local).read_text(encoding="utf-8", errors="replace")[:200000]
+                        m.text = Path(local).read_text(encoding="utf-8", errors="replace")[:MAX_SCRIPT_CHARS]
                     except OSError:
                         pass
 
@@ -586,6 +589,12 @@ def _locate_in_source(anchor: str, norm_source: str, idx_map: list[int], source:
     return None
 
 
+# normalize 分块喂给 LLM 时的提示词包装头，块边界拍没有自己的镜头头时模型会把它
+# 抄进转述开头。原稿里不存在这串字，不剥掉则精确锚定必失败 → 整拍 llm_echo →
+# 成稿直录全稿失守（2026-10-04 聊皮肤13集：26 拍仅第 20 拍被污染，13 窗慢路径）
+_CHUNK_HEAD_RE = re.compile(r"^(?:【剧本片段\s*\d+\s*/\s*\d+】[ \t]*\r?\n?)+")
+
+
 def recover_storyboard_source(beats: list[dict], source: str) -> tuple[list[dict], str]:
     """storyboard 逐字保真回收：LLM 的 source_text 只当定位锚，能定位就以原文切片为准。
 
@@ -601,7 +610,11 @@ def recover_storyboard_source(beats: list[dict], source: str) -> tuple[list[dict
             idx_map.append(i)
     starts: list[int | None] = []
     for b in beats:
-        for anchor in (b.get("source_text") or "", f"{b.get('title') or ''}{b.get('description') or ''}"):
+        raw = b.get("source_text")
+        anchor_text = _CHUNK_HEAD_RE.sub("", raw, count=1) if raw else ""
+        if raw and anchor_text != raw:
+            b["source_text"] = anchor_text
+        for anchor in (anchor_text, f"{b.get('title') or ''}{b.get('description') or ''}"):
             pos = _locate_in_source(anchor[:120], norm_source, idx_map, source)
             if pos is not None:
                 starts.append(pos)
@@ -745,13 +758,20 @@ def detect_fragment_headers(source: str) -> list[tuple[int, str]]:
     return headers
 
 
-_H3_BOUNDARY_RE = re.compile(r"^(?:#{1,4}\s*)?subject_definitions\s*:\s*$", re.I | re.M)
+# 裸段名独占行（原投稿格式）；**加粗段名**+正文同行（markdown 六段式成稿，
+# 2026-10-04 聊皮肤13集：10 镜成稿 0 命中 → LLM 分块把 10 镜拆成 26 拍）
+_H3_BOUNDARY_RE = re.compile(
+    r"^(?:(?:#{1,4}\s*)?subject_definitions\s*:\s*$"
+    r"|(?:#{1,4}\s*)?\*\*\s*subject_definitions\s*:\s*\*\*)",
+    re.I | re.M)
 
 
 def _expand_shot_header_upward(source: str, pos: int) -> int:
     """单镜成稿的拍起点向上扩：把紧邻投搞头部（**Duration/Reference 声明**加粗行、
     围栏开头、空行）并入拍原文——Reference 声明区留在 beat 里，bind 的素材对号与
     首帧声明识别才有依据。遇到其他内容（正文散文/标题）即停。
+    镜头标题行（## Shot N｜…）是头部的最外层：吸收它即停——再往上就是上一镜的
+    加粗尾段（non_diegetic_music 等），会切走上一镜正文。
     """
     head = source[:pos]
     line_starts = [m.start() for m in re.finditer(r"^", head, re.M)]
@@ -766,15 +786,34 @@ def _expand_shot_header_upward(source: str, pos: int) -> int:
             if pos - start > 4000:  # 头部护栏：异常长的不像投搞头部，弃用
                 return pos
             continue
+        if re.match(r"#{1,4}\s+\S", s):
+            start = line_starts[i]
+            if pos - start > 4000:
+                return pos
+            break
         break
     return start
 
 
+# detailed_description 段名存在性检查：裸/加粗段名均可（成稿骨架的第二段）
+_H3_DDET_DECL_RE = re.compile(r"(?im)^(?:\*\*\s*)?detailed_description\s*:")
+# 块首镜头头「## Shot N｜标题」→ 标题（beat 标题保真，不用工艺化的 H3 Shot N）
+_H3_SHOT_TITLE_RE = re.compile(r"(?i)^#{1,4}\s*(?:shot|fragment)\s*0*\d+\s*[｜|:：—–-]?\s*(.+)$")
+
+
+def _h3_shot_title(source: str, pos: int, fallback_no: int) -> str:
+    first = (source[pos:pos + 200] or "").split("\n", 1)[0].strip()
+    m = _H3_SHOT_TITLE_RE.match(first)
+    return (m.group(1).strip()[:80] if m else "") or f"H3 Shot {fallback_no}"
+
+
 def detect_h3_prompt_boundaries(source: str) -> list[tuple[int, str]]:
     """英文成稿分镜（每镜一份完整 H3 六段式 Prompt、无中文片段头）的拍边界识别：
-    每个行首 subject_definitions: 段名即一镜起点（六段式首段，单镜恰一次，不会切在镜中）。
-    仅在中文片段头识别失败时兜底——让英文成稿也能一拍一镜确定性对录，分拍不交给
-    模型猜；plan 阶段照常润色（改写稀释由 PLAN_SYSTEM_COMMON 单调性铁律约束）。
+    每个行首 subject_definitions: 段名即一镜起点（六段式首段，单镜恰一次，不会切在镜中），
+    段名裸写或 **加粗** 皆可；起点向上并入镜头头（## Shot N｜标题 + Duration/Reference
+    声明区），Reference 声明留在拍内，bind 的素材对号才有依据。仅在中文片段头识别
+    失败时兜底——让英文成稿也能一拍一镜确定性对录，分拍不交给模型猜；plan 阶段
+    照常润色（改写稀释由 PLAN_SYSTEM_COMMON 单调性铁律约束）。
 
     全稿只有一处 subject_definitions 骨架（单镜成稿直投，2026-10-01 事故：不足 2 处
     不认 → LLM 慢路径把单连续镜重拆重排）也算：起点向上并入投搞头部，返回 1 拍。
@@ -784,12 +823,20 @@ def detect_h3_prompt_boundaries(source: str) -> list[tuple[int, str]]:
     if not starts:
         return []
     if len(starts) >= 2:
-        return [(starts[i], f"H3 Shot {i + 1}") for i in range(len(starts))]
+        out: list[tuple[int, str]] = []
+        prev = -1
+        for i, s in enumerate(starts):
+            b = _expand_shot_header_upward(src, s)
+            if b <= prev:
+                b = s  # 上扩越界（吞进上一镜）：退回段名行，切片绝不交叉
+            out.append((b, _h3_shot_title(src, b, i + 1)))
+            prev = b
+        return out
     # 单镜：必须带 H3 骨架（detailed_description 段名）才算成稿，正文偶然提到
     # subject_definitions 一词的故事稿不在此列
-    if not re.search(r"(?im)^detailed_description\s*:", src):
+    if not _H3_DDET_DECL_RE.search(src):
         return []
-    return [(_expand_shot_header_upward(src, starts[0]), "H3 Shot 1")]
+    return [(_expand_shot_header_upward(src, starts[0]), _h3_shot_title(src, starts[0], 1))]
 
 
 def _extract_narration(frag: str) -> str:
@@ -886,7 +933,7 @@ async def run_normalize(project_id: str, envelope, trace=None) -> dict:
         "source_material_id": mat.id if mat else None,
         # 原文全文 + 全局设定 preamble（参考图编号表在这里）：后续阶段对齐/声明行
         # 重写的确定性依据，绝不依赖 LLM 的转述保真
-        "source_text": source[:200000],
+        "source_text": source[:MAX_SCRIPT_CHARS],
         "global_notes": "",
     }
     if script_type == "storyboard":
@@ -1082,11 +1129,20 @@ def storyboard_polish_issues(cand: str, source: str) -> list[str]:
 # 闸门还逼模型发明原文没有的视觉风格（"3D animated short"）与摄影限制（"One
 # continuous static shot"）。成稿的时段/镜头结构/风格/摄影必须逐字进视频模型。
 
-_H3_BODY_HEAD_RE = re.compile(r"(?im)^subject_definitions\s*:\s*$")
-_DURATION_DECL_RE = re.compile(r"Duration\s*[：:]\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)")
-_PIC_MAP_RE = re.compile(r"(?i)<Picture\s+(\d+)\s*>\s*(?:←|<=|=|＝)\s*Image\s*0*(\d{1,3})(?!\d)")
-_AUD_MAP_GLOBAL_RE = re.compile(r"(?i)(?:<)?Audio\s*(\d+)\s*(?:>)?\s*(?:←|<=|=|＝)\s*全局\s*(?:Audio\s*)?0*(\d{1,3})(?!\d)")
-_AUD_MAP_TAG_RE = re.compile(r"(?i)<Audio\s+(\d+)\s*>\s*(?:←|<=|=|＝)\s*<Audio\s+(\d+)>")
+# 段名裸写或 **加粗**（markdown 六段式成稿，正文与段名同行）皆可
+_H3_BODY_HEAD_RE = re.compile(r"(?im)^(?:\*\*\s*)?subject_definitions\s*:\s*(?:\*\*)?")
+# 时长声明：V2/V3 稿用中文「生成时长：6秒」（2026-10-03 第12集 V3 全部落 5 秒默认值），
+# 全片位置行（0.00–6.00秒）不在此列；标签可加粗（**Duration:** 4.00 s，第13集）
+_DURATION_DECL_RE = re.compile(r"(?:\*\*)?(?:Duration|生成时长)\s*(?:\*\*)?\s*[：:]\s*(?:\*\*)?\s*(\d+(?:\.\d+)?)\s*(?:秒|s|S)")
+# 声明 token 与箭头/编号之间允许 markdown 装饰（`<Picture 1>` ← **Image02** 反引号
+# 包裹+加粗，连续编号版 v3）——不设防时 parse_picture_map 全空，wants_images 逐镜
+# 为空，角色设定卡把全角色注入每镜（第9镜无孙悟空却画出甲胄猴子，9s 报废）
+# 连接符含表格竖线（V2/V3 绑定表：`<Picture 1>` | Image11.png 或裸槽位
+# Picture 1 | Image05.png 的全局素材列）——竖线后只允许空白/反引号即见 Image，
+# 后续单元格的散文提及不会误采；槽位与全局素材的尖括号/「全局」字样均可省（V3）
+_PIC_MAP_RE = re.compile(r"(?i)<?Picture\s+(\d+)\s*>?[\s`*(（]*(?:←|<=|=|＝|\|+)[\s`*(（]*Image\s*0*(\d{1,3})(?!\d)")
+_AUD_MAP_GLOBAL_RE = re.compile(r"(?i)(?:<)?Audio\s*(\d+)\s*(?:>)?[\s`*(（]*(?:←|<=|=|＝|\|+)[\s`*(（]*(?:全局[\s`*(（]*)?(?:Audio[\s`*(（]*)?0*(\d{1,3})(?!\d)")
+_AUD_MAP_TAG_RE = re.compile(r"(?i)<Audio\s+(\d+)\s*>[\s`*(（]*(?:←|<=|=|＝)[\s`*]*<Audio\s+(\d+)>")
 _AUDIO_TL_DECL_RE = re.compile(r"(?im)^(?:\*\*)?\s*Audio\s*Timeline\s*[：:]\s*(?:\*\*)?\s*(.+)$")
 _TL_WINDOW_RE = re.compile(r"(\d+(?:\.\d+)?)\s*[—–\-]\s*(\d+(?:\.\d+)?)\s*s?")
 _TL_AUDIO_TAG_RE = re.compile(r"(?i)(?:<)?\s*Audio\s*0*(\d+)\s*(?:>)?")
@@ -1099,7 +1155,7 @@ def extract_h3_body(frag: str) -> str | None:
     detailed_description:）返回 None——调用方据此退回 LLM 路径。"""
     frag = frag or ""
     m = _H3_BODY_HEAD_RE.search(frag)
-    if not m or not re.search(r"(?im)^detailed_description\s*:", frag):
+    if not m or not _H3_DDET_DECL_RE.search(frag):
         return None
     rest = frag[m.end():]
     close = re.search(r"^```[ \t]*$", rest, re.M)
@@ -1180,34 +1236,41 @@ def materialize_audio_timeline(frag: str, body: str) -> str:
     return "\n".join(out)
 
 
-def adopt_verbatim_h3_shots(project: Project, beats: list[dict]) -> list[dict] | None:
-    """成稿直录：每拍原文都是 H3 成稿（行首 subject_definitions+detailed_description 骨架，
-    source_fidelity=verbatim）→ 逐字落为该镜 Prompt，plan 主遍零 LLM 调用。只做确定性
+def _adopt_verbatim_h3_shots_beatwise(project: Project, beats: list[dict]) -> list[dict | None]:
+    """成稿直录（逐拍）：每拍原文都是 H3 成稿（行首 subject_definitions+detailed_description
+    骨架，source_fidelity=verbatim）→ 逐字落为该镜 Prompt。只做确定性
     机械适配：Reference 声明 → wants、中文 Audio Timeline → 英文小节、Duration → 时长。
     缺 H3 工艺块（cinematography/lighting/…）不补——补段就是发明（事故里的风格/摄影
-    限制正是六段齐全闸门逼出来的）；任一拍不是成稿返回 None，调用方走原 LLM 路径。
+    限制正是六段齐全闸门逼出来的）。失守拍以 None 占位，调用方决定整稿放弃还是逐拍回退
+    （run_plan 的逐拍回退：失守拍仅占少数时只对它们走 LLM 分窗，直录拍零调用）。
     """
     images = [m for m in project.materials if m.kind == "image"]
     audios = [m for m in project.materials if m.kind == "audio"]
-    shots: list[dict] = []
+    shots: list[dict | None] = []
     for i, b in enumerate(beats):
         frag = (b.get("source_text") or "").strip()
         if not frag or b.get("source_fidelity") not in (None, "verbatim"):
-            return None
+            shots.append(None)
+            continue
         body = extract_h3_body(frag)
         if not body:
-            return None
+            shots.append(None)
+            continue
         prompt = body
         timeline = materialize_audio_timeline(frag, body)
         if timeline:
             prompt = body.rstrip() + "\n\nAudio Timeline:\n" + timeline
-        sm = re.search(r"(?im)^summary\s*:\s*(.+)$", body)
+        sm = re.search(r"(?im)^(?:\*\*\s*)?summary\s*(?:\*\*)?:\s*(?:\*\*)?\s*(.+)$", body)
         summary = (sm.group(1).strip() if sm else "")[:500]
         dm = _DURATION_DECL_RE.search(frag)
         img_ns = parse_picture_map(frag)
         aud_ns = parse_audio_map(frag)
         shots.append({
-            "title": (summary.split(",")[0].split("，")[0][:50] or f"成稿镜 {i + 1}"),
+            # 标题保真：beat 标题是用户原稿「## 镜头NN｜标题」逐字提取（中文、人可读），
+            # 优先于 summary 首段（英文工艺句，第十回 14 镜全英文标题的可读性事故）
+            "title": ((b.get("title") or "").strip()
+                      or summary.split(",")[0].split("，")[0][:50]
+                      or f"成稿镜 {i + 1}"),
             "description": summary or "用户成稿分镜（逐字直录）",
             "prompt": prompt,
             "keyframe_prompt": "",
@@ -1223,6 +1286,12 @@ def adopt_verbatim_h3_shots(project: Project, beats: list[dict]) -> list[dict] |
             "wants_videos": [],
         })
     return shots
+
+
+def adopt_verbatim_h3_shots(project: Project, beats: list[dict]) -> list[dict] | None:
+    """成稿直录（全稿全有或全无）：任一拍失守返回 None，调用方走整稿 LLM 路径。"""
+    beatwise = _adopt_verbatim_h3_shots_beatwise(project, beats)
+    return list(beatwise) if all(s is not None for s in beatwise) else None
 
 
 # ---------------- plan（LLM 信封 + 分批） ----------------
@@ -1257,31 +1326,38 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
             for i, b in enumerate(items)
         )
 
-    def storyboard_windows() -> list[tuple[list[dict], str]]:
+    def storyboard_windows(sel: list[int] | None = None) -> list[tuple[list[dict], str]]:
         """storyboard 分窗：单窗 ≤PLAN_WINDOW_SHOTS 拍且原文累计 ≤PLAN_WINDOW_CHARS 字。
 
         事故（2026-09-21 吕满春西游 6 镜稿）：全稿原文一锅端进一条消息，MiniMax-M3
         是推理模型、思考与正文共用 max_tokens，一次规划多个 H3 六段式长 prompt 时
         预算被思考烧尽、正文为空，连续 3 轮失败。窗小 → 单次任务小，思考与输出
         都落回预算内；每窗自带一拍一镜数量闸门，全稿总数闸门保持不变。
+        sel=None 规划全稿；否则只对选中的拍（0 基拍号，逐拍回退用）分窗，
+        窗内提示与【原文】标注沿用全稿绝对拍号，模型不感知缺拍。
         """
-        windows: list[list[dict]] = []
+        idxs = list(range(len(beats))) if sel is None else sorted(sel)
+        windows: list[tuple[list[int], list[dict]]] = []
+        cur_i: list[int] = []
         cur: list[dict] = []
         cur_chars = 0
-        for b in beats:
+        for i in idxs:
+            b = beats[i]
             size = len(b.get("source_text") or b.get("description") or "") + 100
             if cur and (len(cur) >= PLAN_WINDOW_SHOTS or cur_chars + size > PLAN_WINDOW_CHARS):
-                windows.append(cur)
-                cur, cur_chars = [], 0
+                windows.append((cur_i, cur))
+                cur_i, cur, cur_chars = [], [], 0
+            cur_i.append(i)
             cur.append(b)
             cur_chars += size
         if cur:
-            windows.append(cur)
+            windows.append((cur_i, cur))
         out: list[tuple[list[dict], str]] = []
-        no = 1
-        for win in windows:
+        for idx_win, win in windows:
+            no = idx_win[0] + 1
+            span = f"第 {no}–{idx_win[-1] + 1} 镜" if len(win) > 1 else f"第 {no} 镜"
             note = (
-                f"剧本类型：storyboard（用户分镜已成稿，全稿共 {len(beats)} 镜）→ 本窗为全稿第 {no}–{no + len(win) - 1} 镜，"
+                f"剧本类型：storyboard（用户分镜已成稿，全稿共 {len(beats)} 镜）→ 本窗为全稿{span}，"
                 f"一拍一镜，必须恰好输出 {len(win)} 镜，逐拍对录，严禁增删拆合与虚构画面；"
                 "素材清单已标注上传序号，第 N 张上传图=原文 <Image N>"
             )
@@ -1290,7 +1366,6 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
                 f"规划本窗全部分镜，共 {len(win)} 镜，一次性全部输出（done=true）。"
             )
             out.append((win, base))
-            no += len(win)
         return out
 
     if not is_storyboard:
@@ -1335,9 +1410,9 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
                 break
         return shots
 
-    async def plan_storyboard_windows(extra_note: str = "") -> list[dict]:
+    async def plan_storyboard_windows(extra_note: str = "", sel: list[int] | None = None) -> list[dict]:
         acc: list[dict] = []
-        for w_no, (win, wbase) in enumerate(storyboard_windows()):
+        for w_no, (win, wbase) in enumerate(storyboard_windows(sel)):
             ws = await collect_batches(wbase, extra_note)
             if len(ws) != len(win):
                 if trace:
@@ -1353,9 +1428,25 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
 
     all_shots: list[dict] | None = None
     if is_storyboard and not polish_on:
-        all_shots = adopt_verbatim_h3_shots(project, beats)
-        if all_shots is not None and trace:
-            trace.log("plan_adopted_verbatim", shots=len(all_shots))
+        per_beat = _adopt_verbatim_h3_shots_beatwise(project, beats)
+        failed = [i for i, s in enumerate(per_beat) if s is None]
+        if not failed:
+            all_shots = list(per_beat)
+            if trace:
+                trace.log("plan_adopted_verbatim", shots=len(all_shots))
+        else:
+            # 逐拍回退：一拍失守不再全稿陪葬——直录拍零 LLM，仅失守拍（如分片头
+            # 污染导致的 llm_echo）走分窗规划后按拍序回填；回填数量不对则整体
+            # 落回全稿规划，保真闸门与总数闸门保持不变
+            rescued = await plan_storyboard_windows(sel=failed)
+            if len(rescued) == len(failed):
+                it = iter(rescued)
+                all_shots = [s if s is not None else next(it) for s in per_beat]
+                if trace:
+                    trace.log("plan_adopted_verbatim_partial",
+                              verbatim=len(beats) - len(failed), llm_rescued=len(failed))
+            elif trace:
+                trace.log("plan_partial_rescue_fallback", expected=len(failed), got=len(rescued))
     if all_shots is None:
         all_shots = await (plan_storyboard_windows() if is_storyboard else collect_batches(base_user))
     if not all_shots:
@@ -1464,18 +1555,36 @@ async def run_plan(project_id: str, envelope, trace=None) -> dict:
     # （bind 台词对号、前端分镜抽屉单独窗口展示都用它），台词在 Prompt 里的唯一落点是
     # detailed_description 末尾的英文 Audio Timeline 小节。
 
-    # 角色设定卡注入：无参考图锚定的镜，Prompt 末尾强制注入（跨镜一致性兜底）
-    char_block = ""
-    if chars:
-        char_block = "\n\n## Character Reference（跨镜一致，外观逐字遵守）\n" + "\n".join(
-            f"- {c['name']}：{c['design']}" for c in chars
-        )
-    if char_block:
-        for i, sp in enumerate(all_shots):
-            if sp.get("wants_images"):
-                continue  # 挂参考图的镜外观以图为准，不注入文字设定卡
-            if not any(c.get("design", "")[:20] in scenes[i].prompt for c in chars if c.get("design")):
-                scenes[i].prompt = (scenes[i].prompt.rstrip() + char_block)[:8000]
+    # 角色设定卡注入：无参考图锚定的镜，Prompt 末尾强制注入（跨镜一致性兜底）。
+    # 只注入该镜原文（beat 原文/成稿 Prompt/台词）实际出场的角色——原文没有的角色
+    # 写进设定卡就是幻觉源头（第9镜无孙悟空却被全角色注入，生成出甲胄猴子，9s 报废）。
+    # 名字带姓氏前缀时同时认去姓变体（孙悟空/悟空），英文成稿里中文名以
+    # "Sun Wukong (孙悟空)" 形式存在，中文匹配即可命中
+    def _shot_chars(i: int) -> list[dict]:
+        hay = "\n".join(filter(None, [
+            (beats[i].get("source_text") or "") if i < len(beats) else "",
+            scenes[i].prompt, scenes[i].narration]))
+        out = []
+        for c in chars:
+            name = (c["name"] or "").strip()
+            if not name:
+                continue
+            variants = {name} | ({name[1:]} if len(name) >= 3 else set())
+            if any(v in hay for v in variants if v):
+                out.append(c)
+        return out
+
+    for i, sp in enumerate(all_shots):
+        if sp.get("wants_images"):
+            continue  # 挂参考图的镜外观以图为准，不注入文字设定卡
+        scene_chars = _shot_chars(i)
+        if not scene_chars:
+            continue
+        if not any(c.get("design", "")[:20] in scenes[i].prompt for c in scene_chars if c.get("design")):
+            block = "\n\n## Character Reference（跨镜一致，外观逐字遵守）\n" + "\n".join(
+                f"- {c['name']}：{c['design']}" for c in scene_chars
+            )
+            scenes[i].prompt = (scenes[i].prompt.rstrip() + block)[:8000]
 
     def fn(p: Project) -> None:
         p.scenes = [Scene(**s.model_dump()) for s in scenes]
@@ -1510,7 +1619,7 @@ _REF_HEADER_RE = re.compile(r"^Reference[:：]?$", re.I)
 # 行首允许 markdown 装饰（**Reference 图片：** 加粗投搞头部，2026-10-01 单镜成稿
 # 投稿式：**Reference 图片：** <Picture 1> ← Image 21；…）——不认就对齐全失效，
 # 音频还会被正文 <Audio 1> 标签的兜底错绑到全局第 1 段
-_REF_HEADER_INLINE_RE = re.compile(r"^(?:#{1,4}\s*)?\**\s*Reference\s*[^\s：:]{0,16}\s*[:：]\s*(.*)$", re.I)
+_REF_HEADER_INLINE_RE = re.compile(r"^(?:#{1,4}\s*)?\**\s*Reference\s*[^\s：:]{0,40}\s*[:：]\s*(.*)$", re.I)
 # 已知小节标题（声明区的合法终点）；“##”兼容整段压成一行的 markdown 草稿
 _REF_END_RE = re.compile(
     r"^(Audio\s+Timeline|H3\s*Prompt|H3\s*硬约束|subject_definitions|summary|retention_analysis"
@@ -1519,16 +1628,76 @@ _REF_END_RE = re.compile(
 _REF_PROSE_RE = re.compile(r"^.{41,}$")
 _REF_TAG_RE = re.compile(r"<(?:Image|Audio|Video)\s+\d+\s*>")
 # 独立声明行（「Picture 1=Image 01」「Audio 3｜…」）：行首即编号素材词才是声明，
-# 「0—2秒：从Image 05 …」这类散文叙述行不在此列（仍由散文闸终止声明区）
-_REF_DECL_LINE_RE = re.compile(r"^(?:Picture|Image|Audio|Video)\s*\d+\b", re.I)
-# 裸编号 token（无尖括号）：Lookbehind 挡住英文前缀（MyImage01），不挡中文前缀
-# （本镜Audio 1）；「全局Audio N」与「Audio k=全局 N」是全局号（投稿式声明），
-# 与局部号「本镜Audio K」并存时只认全局
-_PLAIN_IMG_RE = re.compile(r"(?<![A-Za-z0-9>])Image\s*0*(\d{1,3})(?!\d)")
-_PLAIN_VID_RE = re.compile(r"(?<![A-Za-z0-9>])Video\s*0*(\d{1,3})(?!\d)")
+# 「0—2秒：从Image 05 …」这类散文叙述行不在此列（仍由散文闸终止声明区）。
+# 「- 第1张：」清单行（连续编号版分镜稿 v3：`<Picture 1>` ← **Image02**（…））同样
+# 自证为声明——编号+冒号+箭头映射，v3 不认则整稿图片对齐全空（39 张参考图悬空）
+_REF_DECL_LINE_RE = re.compile(
+    r"^(?:(?:-\s*)?(?:Picture|Image|Audio|Video)\s*\d+|-\s*第[0-9一二三四五六七八九十百]+张\s*[:：])", re.I)
+# 裸编号 token（无尖括号）：Lookbehind 挡住英文前缀（MyImage01）与标识符连接符
+# （上传图片_Image01-39/Image04.png 的目录模板——v3 稿每条声明行都带，「_Image01-」
+# 下划线+短横线两侧都不设防，7 个未声明 Image01 的镜全被塞了一张 Image01 幻影参考），
+# 不挡中文前缀（本镜Audio 1）；「全局Audio N」与「Audio k=全局 N」是全局号（投稿式
+# 声明），与局部号「本镜Audio K」并存时只认全局
+_PLAIN_IMG_RE = re.compile(r"(?<![A-Za-z0-9>_])Image\s*0*(\d{1,3})(?!\d)")
+_PLAIN_VID_RE = re.compile(r"(?<![A-Za-z0-9>_])Video\s*0*(\d{1,3})(?!\d)")
 _PLAIN_AUD_GLOBAL_RE = re.compile(
     r"(?i)(?:全局\s*Audio\s*|Audio\s*\d+\s*=\s*全局\s*(?:Audio\s*)?)0*(\d{1,3})(?!\d)")
-_PLAIN_AUD_RE = re.compile(r"(?<![A-Za-z0-9>])Audio\s*0*(\d{1,3})(?!\d)")
+_PLAIN_AUD_RE = re.compile(r"(?<![A-Za-z0-9>_])Audio\s*0*(\d{1,3})(?!\d)")
+
+# 剧本 V2/V3 逐镜绑定表（2026-10-03 第12集两轮事故）：markdown 表格声明素材映射，
+# 没有 Reference 标题行。V2：「| 类型 | 本镜绑定 | 全局素材 | 用途/时点 |」，槽位带
+# 尖括号（`<Picture 1>`）、音频列「全局Audio 01」；V3：「| 上传次序 | 本镜槽位 |
+# 本文件夹内文件 | 用途 |」，槽位裸写（Picture 1）、音频列为文件名（Audio01.mp3）。
+# 共同结构＝某单元格恰为槽位名（Picture/Image/Video/Audio k，反引号/尖括号可选），
+# 其后单元格恰为全局素材（ImageNN.png / VideoNN / 全局Audio NN / AudioNN.mp3）。
+# 老识别（Reference 标题行激活声明区）两版整表漏拆：图片侧不在尖括号词表、裸
+# 文件名只在声明区内采信 → 图片对齐全空；音频侧本镜槽位号被兜底当全局 1 号
+# （仅镜01碰巧对，其余语义互证全炸）。槽位单元格全匹配＋素材单元格紧随＝无散文
+# 误采风险
+_V2_SLOT_CELL_RE = re.compile(r"^`?\s*<?(Picture|Image|Video|Audio)\s+0*(\d{1,3})\s*>?`?$", re.I)
+_V2_FILE_IMG_RE = re.compile(r"(?<![A-Za-z0-9>_])Image\s*0*(\d{1,3})(?!\d)", re.I)
+_V2_FILE_VID_RE = re.compile(r"(?<![A-Za-z0-9>_])Video\s*0*(\d{1,3})(?!\d)", re.I)
+_V2_FILE_AUD_RE = re.compile(r"(?:全局\s*)?Audio\s*0*(\d{1,3})(?!\d)", re.I)
+
+
+def _v2_rows(frag: str):
+    """V2/V3 绑定表行 → (素材kind: image/video/audio, 本镜槽位k, 全局号n, 身份说明)。
+
+    kind 按文件列判定（Picture 槽位配 VideoNN 文件按视频算）；身份取行末用途列。"""
+    for ln in (frag or "").splitlines():
+        s = ln.strip()
+        if not (s.startswith("|") and s.endswith("|")):
+            continue
+        cells = [c.strip() for c in s[1:-1].split("|")]
+        if len(cells) < 3:
+            continue
+        for i, c in enumerate(cells):
+            m = _V2_SLOT_CELL_RE.match(c)
+            if not m:
+                continue
+            slot_kind, k = m.group(1).lower(), int(m.group(2))
+            rest = "|".join(cells[i + 1:])
+            if slot_kind == "audio":
+                fm = _V2_FILE_AUD_RE.search(rest)
+                if fm:
+                    yield "audio", k, int(fm.group(1)), cells[-1]
+            else:
+                fm = _V2_FILE_IMG_RE.search(rest) or _V2_FILE_VID_RE.search(rest)
+                if fm:
+                    vid = fm.re is _V2_FILE_VID_RE
+                    yield ("video" if vid else "image"), k, int(fm.group(1)), cells[-1]
+            break
+
+
+def _v2_table_tokens(frag: str) -> tuple[list[int], list[int], list[int]]:
+    """V2/V3 绑定表行 → 按行序的全局图片/音频/视频号。命中即为表驱动声明，调用方
+    以此为权威——本镜槽位号（<Audio 1>/Audio 1）绝不走老路径兜底（会被误当全局号）。"""
+    img_ns: list[int] = []
+    vid_ns: list[int] = []
+    aud_ns: list[int] = []
+    for kind, _k, n, _ident in _v2_rows(frag):
+        {"image": img_ns, "video": vid_ns, "audio": aud_ns}[kind].append(n)
+    return list(dict.fromkeys(img_ns)), list(dict.fromkeys(aud_ns)), list(dict.fromkeys(vid_ns))
 
 
 def _reference_tokens(frag: str) -> tuple[list[int], list[int], list[int]]:
@@ -1543,6 +1712,10 @@ def _reference_tokens(frag: str) -> tuple[list[int], list[int], list[int]]:
     img_ns: list[int] = []
     aud_ns: list[int] = []
     vid_ns: list[int] = []
+
+    v2 = _v2_table_tokens(frag)
+    if any(v2):
+        return v2
 
     def _take_angle(text: str) -> None:
         for kind, n in re.findall(r"<(Image|Audio|Video)\s+(\d+)>", text):
@@ -1606,7 +1779,7 @@ def _reference_table(source_text: str) -> dict[int, str]:
     for m in re.finditer(
             # 裸编号表行必须带「｜/:/（」分隔符：规则散文「Image 13使用去除…的修正版」不是表项；
             # 「（」覆盖投稿式「Image 04（小墨….png）」内联身份（2026-10-01 单镜成稿）
-            r"(?:<Image\s+(\d+)\s*>\s*[｜|:：]?|(?<![A-Za-z0-9>])Image\s*0*(\d{1,3})(?!\d)\s*[｜|:：（(])\s*([^\n]+)",
+            r"(?:<Image\s+(\d+)\s*>\s*[｜|:：]?|(?<![A-Za-z0-9>_])Image\s*0*(\d{1,3})(?!\d)\s*[｜|:：（(])\s*([^\n]+)",
             source_text or ""):
         # 反引号包裹的标签（`<Image N>`：身份）：捕获串以 `/： 开头时先剥壳再切分，
         # 否则 split 首段为空、身份被丢弃——第07集整张编号表因此解析为空，
@@ -1619,6 +1792,12 @@ def _reference_table(source_text: str) -> dict[int, str]:
         identity = identity.strip().strip("：:|｜）) ").strip()
         if identity:
             table.setdefault(int(m.group(1) or m.group(2)), identity[:120])
+    # V2/V3 绑定表行：全局素材列取号、行末用途列取身份（「Image05.png | 首帧：小墨
+    # 手持颗粒簇近景」）
+    for kind, _k, n, identity in _v2_rows(source_text or ""):
+        identity = (identity or "").strip().strip("`：:|｜ ").strip()
+        if kind != "audio" and identity:
+            table.setdefault(n, identity[:120])
     return table
 
 
@@ -1682,6 +1861,18 @@ def _inject_identity_constraints(prompt: str, inject_turnaround: bool) -> str:
                 f"During the dialogue only the tagged speaker's lips move; {tags} "
                 "keeps the mouth closed at all times.")
     return prompt
+
+
+def _verbatim_h3_prompt(prompt: str, beat_src: str, n_bound: int) -> bool:
+    """成稿直录保真判定：该镜 Prompt 仍是拍原文的 H3 成稿（正文包含原文 body），且
+    原文行首 <Picture> 声明号恰覆盖 1..N（＝绑定序）。V2/V3 绑定表成稿满足——声明行
+    是用户手写的权威锚定句，重建会换成模板句。LLM 重写稿（body 已被改写、声明身份
+    是模型猜测）不满足——其声明行必须按原稿编号表重建（闯西游五行山基准图事故）。"""
+    body = extract_h3_body(beat_src or "")
+    if not body or body not in (prompt or ""):
+        return False
+    ns = {int(k) for k in re.findall(r"(?m)^\s*<Picture\s+(\d+)\s*>", body)}
+    return bool(ns) and ns == set(range(1, n_bound + 1))
 
 
 def rewrite_aligned_prompt(prompt: str, image_ns: list[int], table: dict[int, str],
@@ -1977,9 +2168,12 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
             })
 
     # 3) 未绑定的图/视频素材 → LLM 兜底（带置信度）；同镜不重复挂同身份的图。
-    #    storyboard 已按原稿对齐时不再兜底强塞：原稿没引用的素材就是用户明确不用的
-    #    （"用不上的素材绝不引用"），交给 pending/用户而不是替用户决定
-    storyboard_aligned = is_storyboard and bool(aligned)
+    #    storyboard 已按原稿对齐图片/视频时不再兜底强塞：原稿没引用的素材就是用户
+    #    明确不用的（"用不上的素材绝不引用"），交给 pending/用户而不是替用户决定。
+    #    只有音频对上不算（第12集 V2 表事故：图片声明解析缺口→仅音频互证单镜通过→
+    #    aligned 非空→25 张图全被判"剧本未用"悬空）——图片解析失败时必须允许兜底
+    storyboard_aligned = is_storyboard and any(
+        a["image_mids"] or a["video_mids"] for a in aligned.values())
     free_others = [m for m in keep_mats
                    if m.kind in ("image", "video") and m.url and m.id not in claimed
                    and not storyboard_aligned]
@@ -2108,11 +2302,18 @@ async def run_bind(project_id: str, envelope, trace=None) -> dict:
                     w = all_wants.get(scene.id) or {}
                     wants_mids = [x.get("material_id") for x in (w.get("wants_images") or [])]
                     beat_src = (beats[si].get("source_text") or "") if si < len(beats) else ""
-                    scene.prompt = rewrite_aligned_prompt(
-                        scene.prompt, ns, ref_table, wants_mids=wants_mids, bound_mids=bound_order,
-                        global_mids=[m.id for m in images_in_order],
-                        keyframe_ns={int(x) for x in _KEYFRAME_DECL_RE.findall(beat_src)},
-                        turnaround_guard=bool(re.search(r"多视图|三视图|定妆", beat_src)))[:8000]
+                    guard = bool(re.search(r"多视图|三视图|定妆", beat_src))
+                    if _verbatim_h3_prompt(scene.prompt, beat_src, len(bound_order)):
+                        # V2/V3 成稿直录：声明行/时间轴即绑定顺序，逐字保真，只做中性化
+                        # 与构造性保险注入（2026-10-03 第12集：重建曾把手写锚定句换模板句）
+                        scene.prompt = _inject_identity_constraints(
+                            _neutralize_unbound_refs(scene.prompt), guard)[:8000]
+                    else:
+                        scene.prompt = rewrite_aligned_prompt(
+                            scene.prompt, ns, ref_table, wants_mids=wants_mids, bound_mids=bound_order,
+                            global_mids=[m.id for m in images_in_order],
+                            keyframe_ns={int(x) for x in _KEYFRAME_DECL_RE.findall(beat_src)},
+                            turnaround_guard=guard)[:8000]
                     scene.revision += 1
                     for mid in wants_mids:
                         mat = next((m for m in p.materials if m.id == mid), None)

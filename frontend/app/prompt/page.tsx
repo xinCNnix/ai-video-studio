@@ -21,7 +21,7 @@ export default function PromptPage() {
 
   const [description, setDescription] = useState("");
   const [mode, setMode] = useState("text_to_video");
-  const [modelId, setModelIdRaw] = useState(() => loadModelPref("llm"));
+  const [modelId, setModelIdRaw] = useState("");
   const setModelId = (id: string) => {
     setModelIdRaw(id);
     saveModelPref("llm", id);
@@ -34,6 +34,9 @@ export default function PromptPage() {
   const [refining, setRefining] = useState<string | null>(null);
 
   useEffect(() => {
+    // 记忆的模型偏好须挂载后读 localStorage：服务端首帧没有 window，
+    // 放进 useState 初始化器会让 SSR 与水合的文本不一致（Hydration failed）
+    setModelIdRaw(loadModelPref("llm"));
     void loadCatalog();
     void loadCredentials();
     // eslint-disable-next-line react-hooks/exhaustive-deps
