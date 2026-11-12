@@ -13,6 +13,8 @@
 ffmpeg 转 wav 供 soundfile 稳妥解码；ffmpeg/librosa 不可用或有效浊音帧
 不足时返回 None（调用方回退取第 1 版）。
 """
+from __future__ import annotations
+
 import subprocess
 import tempfile
 import wave

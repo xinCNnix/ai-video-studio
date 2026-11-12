@@ -1,7 +1,8 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  eslint: { ignoreDuringBuilds: true },
+  // 启动脚本使用 127.0.0.1；允许它连接开发服务器的 HMR 和调试通道。
+  allowedDevOrigins: ["127.0.0.1"],
   // 本地工具站：禁用浏览器缓存，避免前端更新后 Chrome 显示旧版本
   async headers() {
     return [
